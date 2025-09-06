@@ -31,6 +31,16 @@ except ImportError:
     SELENIUM_AVAILABLE = False
     logging.warning("Selenium or WebDriver Manager not installed. 'use_selenium' option will not be available.")
 
+# --- Additional imports for screenshot functionality ---
+try:
+    import base64
+    from PIL import Image
+    from io import BytesIO
+    SCREENSHOT_AVAILABLE = True
+except ImportError:
+    SCREENSHOT_AVAILABLE = False
+    logging.warning("PIL not installed. Screenshot functionality will not be available.")
+
 
 # --- Configuration & Initialization ---
 load_dotenv()
@@ -78,7 +88,7 @@ MAX_RESPONSE_TOKENS_PAGE = 300
 MAX_RESPONSE_TOKENS_SUMMARY = 500
 MAX_RESPONSE_TOKENS_PROSPECT = 800
 # For Knowledge Base Generation (from Code 2)
-DEFAULT_TARGET_LANGUAGE = "English"
+DEFAULT_TARGET_LANGUAGE = "en"
 MAX_RESPONSE_TOKENS_LANG_DETECT = 50
 MAX_RESPONSE_TOKENS_PAGE_SELECTION = 2000
 MAX_RESPONSE_TOKENS_KB_EXTRACTION = 8000
@@ -93,6 +103,58 @@ MAX_PAGES_FOR_FALLBACK_DISCOVERY_CRAWL = 30
 
 # --- Directories ---
 REPORTS_DIR = "reports"
+
+# --- Progress Messages in Farsi ---
+PROGRESS_MESSAGES_FA = {
+    "Detecting language...": "تشخیص زبان...",
+    "Discovering all pages (Sitemap)...": "کشف تمام صفحات (نقشه سایت)...",
+    "Performing fallback crawl...": "انجام خزیدن پشتیبان...",
+    "Identifying knowledge-rich content clusters...": "شناسایی خوشه‌های محتوای غنی از دانش...",
+    "Extracting from company information pages...": "استخراج از صفحات اطلاعات شرکت...",
+    "Extracting from educational content pages...": "استخراج از صفحات محتوای آموزشی...",
+    "Extracting from troubleshooting support pages...": "استخراج از صفحات پشتیبانی عیب‌یابی...",
+    "Extracting from buying guides pages...": "استخراج از صفحات راهنمای خرید...",
+    "Extracting from technical explanations pages...": "استخراج از صفحات توضیحات فنی...",
+    "Extracting from service information pages...": "استخراج از صفحات اطلاعات خدمات...",
+    "Compiling comprehensive knowledge base...": "تدوین پایگاه دانش جامع...",
+    "Knowledge base generation completed successfully.": "تولید پایگاه دانش با موفقیت تکمیل شد.",
+    "Failed to generate knowledge base.": "تولید پایگاه دانش با شکست مواجه شد.",
+    # New progress messages for improved system
+    "Capturing main page screenshot...": "گرفتن تصویر کامل صفحه اصلی...",
+    "Discovering core website pages...": "کشف صفحات اصلی وب‌سایت...",
+    "Extracting knowledge from core pages...": "استخراج دانش از صفحات اصلی...",
+    "Compiling comprehensive knowledge base...": "تدوین پایگاه دانش جامع...",
+}
+
+def get_progress_fa(progress_en: str) -> str:
+    """Get Farsi translation of progress message."""
+    # Handle dynamic progress messages with page numbers
+    if "Extracting from page" in progress_en and "/" in progress_en:
+        # Extract page numbers from "Extracting from page X/Y: URL"
+        try:
+            parts = progress_en.split(":")
+            if len(parts) >= 2:
+                page_info = parts[0].strip()  # "Extracting from page X/Y"
+                url_part = parts[1].strip()   # "URL"
+                # Extract X/Y from the message
+                if "Extracting from page" in page_info:
+                    numbers = page_info.replace("Extracting from page", "").strip()
+                    return f"استخراج از صفحه {numbers}: {url_part}"
+        except:
+            pass
+    
+    # Handle other dynamic messages
+    for key, value in PROGRESS_MESSAGES_FA.items():
+        if key in progress_en:
+            return value
+    
+    return PROGRESS_MESSAGES_FA.get(progress_en, progress_en)
+
+def update_job_progress(job_id: str, progress_message: str):
+    """Update job progress with both English and Farsi messages."""
+    with jobs_lock:
+        jobs[job_id]["progress"] = progress_message
+        jobs[job_id]["progress_fa"] = get_progress_fa(progress_message)
 
 # --- Tokenizer and Pricing ---
 try:
@@ -135,6 +197,89 @@ STANDARD_CORE_PAGE_PATHS = {
                 "حریم-خصوصی", "سیاست-حفظ-حریم-خصوصی", "ارسال", "نحوه-ارسال",
                 "بازگشت-کالا", "سوالات-متداول", "پرسش-های-متداول", "راهنمای-خرید", "خدمات"]
 }
+
+def discover_core_pages_only(base_url: str, specific_pages: list = None) -> list[dict]:
+    """
+    Discover only core website pages that are essential for chatbot knowledge.
+    If specific_pages is provided, use those URLs directly.
+    Otherwise, try to find common core pages.
+    """
+    discovered_pages = []
+    
+    # If specific pages are provided, use them directly
+    if specific_pages:
+        logger.info(f"Using provided specific pages: {len(specific_pages)} pages")
+        for page_url in specific_pages:
+            try:
+                # Validate the URL is accessible
+                response = requests.head(page_url, headers={'User-Agent': CRAWLER_USER_AGENT}, timeout=10, allow_redirects=True)
+                if response.status_code < 400:
+                    discovered_pages.append({
+                        'url': page_url,
+                        'title': 'N/A',
+                        'type': 'specified_core_page'
+                    })
+                    logger.info(f"✓ Core page accessible: {page_url}")
+                else:
+                    logger.warning(f"✗ Core page not accessible (HTTP {response.status_code}): {page_url}")
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"✗ Core page not accessible (Error): {page_url} - {e}")
+        
+        # Always include the main page
+        if base_url not in [p['url'] for p in discovered_pages]:
+            discovered_pages.insert(0, {
+                'url': base_url,
+                'title': 'Main Page',
+                'type': 'main_page'
+            })
+        
+        return discovered_pages
+    
+    # If no specific pages provided, try to discover core pages automatically
+    logger.info(f"Auto-discovering core pages for {base_url}")
+    
+    # Always start with the main page
+    discovered_pages.append({
+        'url': base_url,
+        'title': 'Main Page', 
+        'type': 'main_page'
+    })
+    
+    # Try to find standard core pages by common path patterns
+    parsed_url = urlparse(base_url)
+    base_path = f"{parsed_url.scheme}://{parsed_url.netloc}"
+    
+    # Common core page patterns to try
+    core_patterns = [
+        "/about/", "/about-us/", "/درباره-ما/",
+        "/contact/", "/contact-us/", "/تماس-با-ما/", "/تماس/",
+        "/terms/", "/terms-and-conditions/", "/قوانین/", "/شرایط/", "/قوانین-شرایط/",
+        "/privacy/", "/privacy-policy/", "/حریم-خصوصی/",
+        "/faq/", "/faqs/", "/سوالات-متداول/", "/پرسش-های-متداول/",
+        "/help/", "/support/", "/پشتیبانی/", "/راهنما/",
+        "/services/", "/خدمات/",
+        "/returns/", "/return-policy/", "/بازگشت-کالا/",
+        "/shipping/", "/delivery/", "/ارسال/",
+        "/installments-rules/", "/اقساط/"
+    ]
+    
+    for pattern in core_patterns:
+        test_url = base_path + pattern
+        try:
+            response = requests.head(test_url, headers={'User-Agent': CRAWLER_USER_AGENT}, timeout=5, allow_redirects=True)
+            if response.status_code < 400:
+                discovered_pages.append({
+                    'url': test_url,
+                    'title': pattern.strip('/').replace('-', ' ').title(),
+                    'type': 'auto_discovered_core_page'
+                })
+                logger.info(f"✓ Found core page: {test_url}")
+        except requests.exceptions.RequestException:
+            # Silently continue - many URLs won't exist
+            pass
+    
+    logger.info(f"Core page discovery completed: {len(discovered_pages)} pages found")
+    return discovered_pages
 
 # --- Job Management (Thread-Safe) ---
 jobs = {}
@@ -458,6 +603,50 @@ def selenium_crawl_website(base_url, max_pages=10):
         if driver: driver.quit()
     return found_pages_details
 
+def capture_full_page_screenshot(url: str) -> str | None:
+    """Capture a full page screenshot and return as base64 encoded string."""
+    if not SELENIUM_AVAILABLE or not SCREENSHOT_AVAILABLE:
+        logger.warning("Screenshot functionality not available - missing Selenium or PIL")
+        return None
+    
+    driver = None
+    try:
+        chrome_options = ChromeOptions()
+        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--window-size=1920,1080")
+        chrome_options.add_argument(f"user-agent={CRAWLER_USER_AGENT}")
+        
+        service = ChromeService(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        driver.set_page_load_timeout(SELENIUM_PAGE_LOAD_TIMEOUT)
+        
+        # Navigate to the URL
+        driver.get(url)
+        WebDriverWait(driver, SELENIUM_PAGE_LOAD_TIMEOUT).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        time.sleep(SELENIUM_RENDER_WAIT_SECONDS)
+        
+        # Get the full page height and set window size
+        total_height = driver.execute_script("return document.body.scrollHeight")
+        driver.set_window_size(1920, total_height)
+        time.sleep(2)  # Wait for resize
+        
+        # Take screenshot
+        screenshot_png = driver.get_screenshot_as_png()
+        
+        # Convert to base64
+        screenshot_base64 = base64.b64encode(screenshot_png).decode('utf-8')
+        logger.info(f"Successfully captured full page screenshot for {url}")
+        return screenshot_base64
+        
+    except Exception as e:
+        logger.error(f"Failed to capture screenshot for {url}: {e}")
+        return None
+    finally:
+        if driver:
+            driver.quit()
+
 
 # --- OpenAI Helper Functions (Feature-Specific) ---
 
@@ -504,12 +693,20 @@ def qualify_prospect_with_openai(page_content: str, prospect_url: str, user_prof
 def detect_language_from_html_with_openai(html_snippet: str, url: str) -> tuple[str, int, int]:
     if not openai_client: raise ConnectionError("OpenAI client not initialized.")
     if not html_snippet or not html_snippet.strip(): return DEFAULT_TARGET_LANGUAGE, 0, 0
-    prompt = f"""From this HTML from {url}, identify the primary visible human language of the MAIN content. Respond with the full English name of the language (e.g., "English", "Farsi"). HTML: ```{html_snippet}```"""
+    prompt = f"""From this HTML from {url}, identify the primary visible human language of the MAIN content. 
+    
+    Respond with ONLY the 2-letter ISO language code (e.g., "en" for English, "fa" for Farsi/Persian, "ar" for Arabic, "fr" for French, "de" for German, "es" for Spanish, etc.).
+    
+    HTML: ```{html_snippet}```"""
     p_tokens = count_tokens(prompt)
     completion = openai_client.chat.completions.create(model=OPENAI_MODEL, messages=[{"role": "user", "content": prompt}], max_tokens=MAX_RESPONSE_TOKENS_LANG_DETECT)
-    lang = completion.choices[0].message.content.strip().capitalize()
+    lang = completion.choices[0].message.content.strip().lower()
     c_tokens = completion.usage.completion_tokens if completion.usage else 0
-    return (lang, p_tokens, c_tokens) if lang and "Undetermined" not in lang else (DEFAULT_TARGET_LANGUAGE, p_tokens, c_tokens)
+    # Validate it's a proper language code
+    if len(lang) == 2 and lang.isalpha():
+        return lang, p_tokens, c_tokens
+    else:
+        return DEFAULT_TARGET_LANGUAGE, p_tokens, c_tokens
 
 def analyze_all_urls_comprehensively(page_details: list[dict], root_url: str, lang: str) -> tuple[dict, int, int]:
     """Analyze ALL discovered URLs and categorize them comprehensively."""
@@ -518,17 +715,30 @@ def analyze_all_urls_comprehensively(page_details: list[dict], root_url: str, la
     # Prepare URL list for analysis
     urls_list = [p['url'] for p in page_details]
     
-    # If too many URLs, sample them intelligently
-    if len(urls_list) > 500:
-        # Take first 200, last 200, and random sample from middle
-        first_part = urls_list[:200]
-        last_part = urls_list[-200:]
-        middle_part = urls_list[200:-200]
-        if len(middle_part) > 0:
-            import random
-            random.seed(42)
-            middle_sample = random.sample(middle_part, min(100, len(middle_part)))
-            urls_list = first_part + middle_sample + last_part
+    # If too many URLs, sample them intelligently with priority for important pages
+    if len(urls_list) > 300:  # Reduced limit for better reliability
+        import random
+        random.seed(42)
+        
+        # Prioritize important pages
+        priority_urls = []
+        regular_urls = []
+        
+        for url in urls_list:
+            url_lower = url.lower()
+            if any(keyword in url_lower for keyword in ['about', 'contact', 'home', 'index', 'service', 'policy', 'help', 'faq', 'support', 'terms', 'privacy']):
+                priority_urls.append(url)
+            elif not any(skip in url_lower for skip in ['wp-content', 'assets', 'css', 'js', 'images', 'uploads', 'cache', 'admin', 'login', 'register', 'cart', 'checkout']):
+                regular_urls.append(url)
+        
+        # Take priority pages and sample regular pages
+        sampled_urls = priority_urls[:50]  # Take up to 50 priority pages
+        remaining_slots = 250 - len(sampled_urls)  # Leave room for 250 total URLs
+        if remaining_slots > 0 and regular_urls:
+            sampled_urls.extend(random.sample(regular_urls, min(remaining_slots, len(regular_urls))))
+        
+        urls_list = sampled_urls
+        logger.info(f"Sampled {len(urls_list)} URLs for analysis ({len(priority_urls)} priority pages found)")
     
     urls_text = "\n".join([f"- {url}" for url in urls_list])
     
@@ -570,149 +780,311 @@ def analyze_all_urls_comprehensively(page_details: list[dict], root_url: str, la
     c_tokens = completion.usage.completion_tokens if completion.usage else 0
     
     try:
-        response_data = json.loads(completion.choices[0].message.content)
+        response_content = completion.choices[0].message.content.strip()
+        # Try to extract JSON from the response if it's wrapped in markdown or other text
+        if '```json' in response_content:
+            json_start = response_content.find('```json') + 7
+            json_end = response_content.find('```', json_start)
+            if json_end != -1:
+                response_content = response_content[json_start:json_end].strip()
+        elif '```' in response_content:
+            json_start = response_content.find('```') + 3
+            json_end = response_content.rfind('```')
+            if json_end != -1 and json_end > json_start:
+                response_content = response_content[json_start:json_end].strip()
+        
+        response_data = json.loads(response_content)
         return response_data, p_tokens, c_tokens
     except (json.JSONDecodeError, TypeError) as e:
         logger.error(f"Error parsing AI response for URL analysis: {e}")
-        return {}, p_tokens, c_tokens
+        logger.error(f"Raw response content: {completion.choices[0].message.content[:500]}...")
+        
+        # Return a fallback structure with improved basic categorization
+        company_keywords = ['about', 'contact', 'home', 'index', 'درباره', 'تماس', 'قوانین', 'شرایط', 'privacy', 'policy', 'terms', 'faq', 'help', 'support']
+        service_keywords = ['service', 'support', 'help', 'خدمات', 'پشتیبانی', 'راهنما']
+        skip_keywords = ['login', 'register', 'cart', 'checkout', 'wp-admin', 'wp-content', 'assets', 'css', 'js', 'images']
+        
+        company_pages = [page['url'] for page in page_details[:20] if any(keyword in page['url'].lower() for keyword in company_keywords)]
+        service_pages = [page['url'] for page in page_details[:20] if any(keyword in page['url'].lower() for keyword in service_keywords)]
+        product_pages = [page['url'] for page in page_details[:15] if not any(keyword in page['url'].lower() for keyword in skip_keywords + company_keywords + service_keywords)]
+        
+        fallback_response = {
+            "company_info_pages": company_pages,
+            "product_pages": product_pages,
+            "service_pages": service_pages,
+            "categories_summary": "Unable to perform detailed analysis due to parsing error, using enhanced URL pattern matching with Persian keywords"
+        }
+        logger.info(f"Using fallback categorization: {len(fallback_response['company_info_pages'])} company, {len(fallback_response['product_pages'])} product, {len(fallback_response['service_pages'])} service pages")
+        return fallback_response, p_tokens, c_tokens
 
-def generate_comprehensive_product_catalog(page_details: list[dict], root_url: str, lang: str) -> tuple[dict, int, int]:
-    """Generate a comprehensive product catalog from all discovered pages."""
+# Product catalog generation removed - focusing on knowledge base creation for chatbots
+# If categories are found during analysis, they will be mentioned in the knowledge base
+
+def identify_knowledge_rich_content_clusters(page_details: list[dict], root_url: str, lang: str) -> tuple[dict, int, int]:
+    """Identify and prioritize knowledge-rich content clusters for chatbot training."""
     if not openai_client: raise ConnectionError("OpenAI client not initialized.")
     
-    # Filter for likely product pages
-    product_urls = []
-    for page in page_details:
-        url = page['url'].lower()
-        # Skip obvious non-product pages
-        if any(skip in url for skip in ['/cart/', '/login/', '/register/', '/checkout/', '/account/', '/admin/', '/api/', '/wp-admin/', '/wp-content/', '/assets/', '/css/', '/js/', '/images/', '/uploads/', '/cache/', '/temp/', '/tmp/', '/about/', '/contact/', '/terms/', '/privacy/', '/help/', '/faq/']):
-            continue
-        product_urls.append(page['url'])
+    # Prepare URL list for analysis - limit for better processing
+    urls_list = [p['url'] for p in page_details]
     
-    # Sample if too many
-    if len(product_urls) > 300:
+    # Smart sampling with priority for knowledge content
+    if len(urls_list) > 400:
         import random
         random.seed(42)
-        product_urls = random.sample(product_urls, 300)
-    
-    urls_text = "\n".join([f"- {url}" for url in product_urls])
-    
-    prompt = f"""Analyze the following URLs from {root_url} and generate a comprehensive product catalog.
-
-    Based on the URL patterns and structure, identify:
-    1. Product categories and types
-    2. Brands and manufacturers
-    3. Product features and specifications
-    4. Price ranges and availability (IMPORTANT: ALL PRICES MUST BE IN TOMAN/IRT, NOT DOLLARS)
-    5. Any special offers or promotions
-
-    CRITICAL PRICING REQUIREMENTS:
-    - ALL prices MUST be in Toman (IRT) currency
-    - Do NOT use dollar signs ($) or USD
-    - Use تومان or Toman for all price references
-    - Convert any dollar estimates to Toman (approximate rate: 1 USD ≈ 500,000 Toman)
-    - Price ranges should be in format like: "50,000,000 - 100,000,000 تومان"
-
-    IMPORTANT:
-    - Analyze URL patterns to understand product structure
-    - Identify product categories, brands, and types
-    - Estimate the scope and variety of products
-    - Note any special features or services
-    - ALL PRICES IN TOMAN ONLY
-
-    URLs to analyze:
-    {urls_text}
-
-    Respond with a comprehensive JSON object:
-    {{
-        "total_products_estimated": number,
-        "product_categories": ["category1", "category2", ...],
-        "brands": ["brand1", "brand2", ...],
-        "product_types": ["type1", "type2", ...],
-        "price_ranges": ["range1 تومان", "range2 تومان", ...],
-        "special_features": ["feature1", "feature2", ...],
-        "products": [
-            {{
-                "name": "Product Name",
-                "category": "Category",
-                "brand": "Brand",
-                "estimated_price": "Price Range in Toman",
-                "url_pattern": "URL Pattern"
-            }}
+        
+        # Define knowledge-rich URL patterns
+        knowledge_patterns = [
+            'how-to', 'guide', 'tutorial', 'tips', 'best-', 'what-is', 'vs-', 'comparison',
+            'install', 'setup', 'troubleshoot', 'solve', 'fix', 'error', 'problem',
+            'about', 'contact', 'policy', 'terms', 'faq', 'help', 'support', 'service',
+            'branch', 'location', 'درباره', 'تماس', 'راهنما', 'آموزش', 'نصب', 'حل'
         ]
-    }}
-    """
+        
+        # Categorize URLs by knowledge value
+        high_value_urls = []
+        medium_value_urls = []
+        low_value_urls = []
+        
+        for url in urls_list:
+            url_lower = url.lower()
+            # Skip technical/admin pages
+            if any(skip in url_lower for skip in ['wp-admin', 'wp-content', 'assets', 'css', 'js', 'images', 'cache', 'login', 'register', 'cart', 'checkout']):
+                continue
+            # High value: knowledge-rich content
+            elif any(pattern in url_lower for pattern in knowledge_patterns):
+                high_value_urls.append(url)
+            # Medium value: category/brand pages
+            elif any(cat in url_lower for cat in ['category', 'brand', 'tag', 'archive']):
+                medium_value_urls.append(url)
+            # Low value: individual products
+            elif 'product' in url_lower:
+                low_value_urls.append(url)
+            else:
+                medium_value_urls.append(url)
+        
+        # Sample intelligently: prioritize high-value content
+        sampled_urls = []
+        sampled_urls.extend(high_value_urls[:150])  # Take most high-value content
+        remaining_slots = 400 - len(sampled_urls)
+        
+        if remaining_slots > 0 and medium_value_urls:
+            sampled_urls.extend(random.sample(medium_value_urls, min(remaining_slots // 2, len(medium_value_urls))))
+        
+        remaining_slots = 400 - len(sampled_urls)
+        if remaining_slots > 0 and low_value_urls:
+            sampled_urls.extend(random.sample(low_value_urls, min(remaining_slots, len(low_value_urls))))
+        
+        urls_list = sampled_urls
+        logger.info(f"Prioritized {len(urls_list)} URLs for knowledge analysis: {len(high_value_urls)} high-value, {len(medium_value_urls)} medium-value, {len(low_value_urls)} low-value")
+    
+    urls_text = "\n".join([f"- {url}" for url in urls_list])
+    
+    # Create language-appropriate prompts and descriptions
+    if lang == 'fa':
+        cluster_descriptions = {
+            "educational_content": "محتوای آموزشی، راهنماها و آموزش‌های فنی",
+            "buying_guides": "راهنماهای خرید، مقایسه و توصیه‌ها",
+            "technical_explanations": "تعاریف مفاهیم و توضیحات فنی",
+            "troubleshooting_support": "محتوای حل مشکل و پشتیبانی",
+            "company_information": "درباره شرکت، تماس، سیاست‌ها و اطلاعات شرکت",
+            "service_information": "خدمات، فرآیندهای پشتیبانی و ویژگی‌ها"
+        }
+        prompt_lang_instruction = f"CRITICAL: ALL descriptions and analysis_summary MUST be written in Persian/Farsi ({lang}), not English."
+    else:
+        cluster_descriptions = {
+            "educational_content": "Tutorial, how-to, and educational content",
+            "buying_guides": "Comparison guides and recommendations", 
+            "technical_explanations": "Concept definitions and technical explanations",
+            "troubleshooting_support": "Problem-solving and support content",
+            "company_information": "About, contact, policies, and company info",
+            "service_information": "Services, support processes, and features"
+        }
+        prompt_lang_instruction = f"CRITICAL: ALL descriptions and analysis_summary MUST be written in {lang}."
+
+    prompt = f"""Analyze the following URLs from {root_url} and identify KNOWLEDGE-RICH CONTENT CLUSTERS for chatbot training.
+
+Your goal is to find pages that contain valuable information for customer service, education, and support - STRICTLY AVOID individual product pages.
+
+PRIORITIZE these types of content clusters:
+
+1. **Educational/Tutorial Content**: How-to guides, tutorials, installation guides, setup instructions
+2. **Buying Guides/Recommendations**: Best practices, comparisons, decision-making guides (NOT individual products)
+3. **Technical Explanations**: What-is pages, concept definitions, feature explanations
+4. **Troubleshooting/Support**: Problem-solving guides, error fixes, tips and tricks
+5. **Company Information**: About pages, contact info, policies, terms, branch locations
+6. **Service Information**: Services offered, support processes, warranty info
+
+STRICTLY AVOID:
+- Individual product listing pages (like /product/specific-item)
+- Shopping cart/checkout pages
+- User account pages
+- Technical/admin pages
+- Product catalog pages
+
+Focus on KNOWLEDGE and SUPPORT content that helps customers understand, learn, and solve problems.
+
+{prompt_lang_instruction}
+
+URLs to analyze:
+{urls_text}
+
+Respond with a JSON object categorizing URLs into knowledge-rich clusters:
+{{
+    "educational_content": {{
+        "urls": ["url1", "url2", ...],
+        "description": "{cluster_descriptions['educational_content']}"
+    }},
+    "buying_guides": {{
+        "urls": ["url1", "url2", ...],
+        "description": "{cluster_descriptions['buying_guides']}"
+    }},
+    "technical_explanations": {{
+        "urls": ["url1", "url2", ...],
+        "description": "{cluster_descriptions['technical_explanations']}"
+    }},
+    "troubleshooting_support": {{
+        "urls": ["url1", "url2", ...],
+        "description": "{cluster_descriptions['troubleshooting_support']}"
+    }},
+    "company_information": {{
+        "urls": ["url1", "url2", ...],
+        "description": "{cluster_descriptions['company_information']}"
+    }},
+    "service_information": {{
+        "urls": ["url1", "url2", ...],
+        "description": "{cluster_descriptions['service_information']}"
+    }},
+    "priority_extraction_order": ["cluster_name1", "cluster_name2", ...],
+    "total_knowledge_pages_identified": number,
+    "analysis_summary": "Brief summary of knowledge content found (in {lang})"
+}}"""
     
     p_tokens = count_tokens(prompt)
     completion = openai_client.chat.completions.create(
         model=OPENAI_MODEL, messages=[{"role": "user", "content": prompt}],
-        max_tokens=MAX_RESPONSE_TOKENS_KB_EXTRACTION, response_format={"type": "json_object"}
+        max_tokens=MAX_RESPONSE_TOKENS_PAGE_SELECTION * 2, response_format={"type": "json_object"}
     )
     c_tokens = completion.usage.completion_tokens if completion.usage else 0
     
     try:
-        response_data = json.loads(completion.choices[0].message.content)
+        response_content = completion.choices[0].message.content.strip()
+        # Try to extract JSON from the response if it's wrapped in markdown or other text
+        if '```json' in response_content:
+            json_start = response_content.find('```json') + 7
+            json_end = response_content.find('```', json_start)
+            if json_end != -1:
+                response_content = response_content[json_start:json_end].strip()
+        elif '```' in response_content:
+            json_start = response_content.find('```') + 3
+            json_end = response_content.rfind('```')
+            if json_end != -1 and json_end > json_start:
+                response_content = response_content[json_start:json_end].strip()
+        
+        response_data = json.loads(response_content)
         return response_data, p_tokens, c_tokens
     except (json.JSONDecodeError, TypeError) as e:
-        logger.error(f"Error parsing AI response for product catalog: {e}")
-        return {}, p_tokens, c_tokens
+        logger.error(f"Error parsing knowledge cluster analysis: {e}")
+        logger.error(f"Raw response content: {completion.choices[0].message.content[:500]}...")
+        
+        # Enhanced fallback with knowledge-focused categorization
+        knowledge_patterns = ['how-to', 'guide', 'tutorial', 'tips', 'best-', 'what-is', 'vs-', 'install', 'درباره', 'تماس', 'راهنما', 'آموزش']
+        company_patterns = ['about', 'contact', 'policy', 'terms', 'branch', 'location', 'درباره', 'تماس', 'قوانین', 'شرایط']
+        support_patterns = ['help', 'support', 'faq', 'troubleshoot', 'solve', 'fix', 'error', 'problem', 'پشتیبانی', 'راهنما']
+        
+        educational_urls = [url for url in urls_list if any(pattern in url.lower() for pattern in ['how-to', 'tutorial', 'guide', 'install', 'setup', 'آموزش', 'نصب'])]
+        company_urls = [url for url in urls_list if any(pattern in url.lower() for pattern in company_patterns)]
+        support_urls = [url for url in urls_list if any(pattern in url.lower() for pattern in support_patterns)]
+        
+        # Create language-appropriate descriptions
+        if lang == 'fa':
+            descriptions = {
+                "educational_content": "محتوای آموزشی و راهنماهای فنی",
+                "company_information": "اطلاعات شرکت و سیاست‌ها", 
+                "troubleshooting_support": "محتوای پشتیبانی و عیب‌یابی",
+                "buying_guides": "راهنماهای خرید شناسایی نشد در بازگشتی",
+                "technical_explanations": "توضیحات فنی شناسایی نشد در بازگشتی",
+                "service_information": "اطلاعات خدمات شناسایی نشد در بازگشتی",
+                "analysis_summary": "تجزیه و تحلیل بازگشتی با استفاده از تطبیق الگو برای محتوای غنی از دانش"
+            }
+        else:
+            descriptions = {
+                "educational_content": "Educational and tutorial content",
+                "company_information": "Company information and policies",
+                "troubleshooting_support": "Support and troubleshooting content", 
+                "buying_guides": "No buying guides identified in fallback",
+                "technical_explanations": "No technical explanations identified in fallback",
+                "service_information": "No service information identified in fallback",
+                "analysis_summary": "Fallback analysis using pattern matching for knowledge-rich content"
+            }
+        
+        fallback_response = {
+            "educational_content": {"urls": educational_urls[:10], "description": descriptions["educational_content"]},
+            "company_information": {"urls": company_urls[:10], "description": descriptions["company_information"]},
+            "troubleshooting_support": {"urls": support_urls[:5], "description": descriptions["troubleshooting_support"]},
+            "buying_guides": {"urls": [], "description": descriptions["buying_guides"]},
+            "technical_explanations": {"urls": [], "description": descriptions["technical_explanations"]},
+            "service_information": {"urls": [], "description": descriptions["service_information"]},
+            "priority_extraction_order": ["company_information", "educational_content", "troubleshooting_support"],
+            "total_knowledge_pages_identified": len(educational_urls) + len(company_urls) + len(support_urls),
+            "analysis_summary": descriptions["analysis_summary"]
+        }
+        
+        logger.info(f"Using fallback knowledge cluster analysis: {fallback_response['total_knowledge_pages_identified']} knowledge pages identified")
+        return fallback_response, p_tokens, c_tokens
 
-def compile_comprehensive_knowledge_base(extracted_content: dict, product_catalog: dict, url_analysis: dict, base_url: str, lang: str) -> tuple[str, int, int]:
-    """Compile a comprehensive knowledge base from all gathered information."""
+def compile_comprehensive_knowledge_base(extracted_content: dict, knowledge_clusters: dict, base_url: str, lang: str) -> tuple[str, int, int]:
+    """Compile a comprehensive knowledge base from knowledge clusters."""
     if not openai_client: raise ConnectionError("OpenAI client not initialized.")
     
-    # Prepare content sections
-    company_info_text = ""
-    if extracted_content.get('company_info'):
-        company_info_text = "\n\n".join([chunk.get('extracted_chunk', '') for chunk in extracted_content['company_info']])
+    # Prepare content sections from knowledge clusters
+    content_sections = {}
     
-    product_info_text = ""
-    if extracted_content.get('product_info'):
-        product_info_text = "\n\n".join([chunk.get('extracted_chunk', '') for chunk in extracted_content['product_info']])
+    for cluster_name, cluster_content in extracted_content.items():
+        if cluster_content:
+            cluster_text = "\n\n".join([chunk.get('extracted_chunk', '') for chunk in cluster_content])
+            content_sections[cluster_name] = cluster_text
     
-    service_info_text = ""
-    if extracted_content.get('service_info'):
-        service_info_text = "\n\n".join([chunk.get('extracted_chunk', '') for chunk in extracted_content['service_info']])
+    # Prepare comprehensive prompt with knowledge cluster sections
+    content_sections_text = ""
+    for cluster_name, cluster_text in content_sections.items():
+        section_title = cluster_name.replace('_', ' ').title()
+        content_sections_text += f"\n\n{section_title.upper()}:\n{cluster_text}"
     
-    # Prepare comprehensive prompt
     prompt = f"""Create a COMPREHENSIVE and DETAILED knowledge base for {base_url} in {lang}.
 
-    Use ALL the following information to create the most complete knowledge base possible:
+    Use ALL the following information extracted from knowledge-rich content clusters to create the most complete knowledge base possible:
 
-    COMPANY INFORMATION:
-    {company_info_text}
+    {content_sections_text}
 
-    PRODUCT INFORMATION:
-    {product_info_text}
+    KNOWLEDGE ANALYSIS SUMMARY:
+    - Total knowledge pages identified: {knowledge_clusters.get('total_knowledge_pages_identified', 0)}
+    - Analysis summary: {knowledge_clusters.get('analysis_summary', 'Knowledge cluster analysis completed')}
+    - Content clusters processed: {', '.join(extracted_content.keys())}
 
-    SERVICE INFORMATION:
-    {service_info_text}
-
-    PRODUCT CATALOG ANALYSIS:
-    {json.dumps(product_catalog, indent=2, ensure_ascii=False)}
-
-    URL ANALYSIS SUMMARY:
-    - Total pages analyzed: {len(url_analysis.get('company_info_pages', []) + url_analysis.get('product_pages', []) + url_analysis.get('service_pages', []))}
-    - Company info pages: {len(url_analysis.get('company_info_pages', []))}
-    - Product pages: {len(url_analysis.get('product_pages', []))}
-    - Service pages: {len(url_analysis.get('service_pages', []))}
-
-    CRITICAL REQUIREMENTS:
-    1. Create a VERY DETAILED and COMPREHENSIVE knowledge base
-    2. Include ALL information from all sources
-    3. Organize into clear sections with proper headings
-    4. Include product catalog, company info, services, policies
-    5. Make it as complete and thorough as possible
-    6. Use proper Markdown formatting
+    CRITICAL REQUIREMENTS FOR CHATBOT KNOWLEDGE BASE:
+    1. Create a VERY DETAILED and COMPREHENSIVE knowledge base optimized for AI chatbot use
+    2. Include ALL information from all knowledge clusters in a structured, searchable format
+    3. Create SEPARATE, DETAILED SECTIONS for each knowledge cluster type
+    4. Focus EXCLUSIVELY on educational content, company information, troubleshooting guides, and customer service information
+    5. COMPLETELY AVOID product specifications, individual product details, or product catalogs
+    6. Use proper Markdown formatting with clear hierarchical structure (##, ###, ####)
     7. Write entirely in {lang}
-    8. Include tables, lists, and structured information
-    9. Be comprehensive and detailed
-    10. ALL PRICES MUST BE IN TOMAN (IRT) - NEVER USE DOLLARS
-    11. Convert any dollar prices to Toman (1 USD ≈ 500,000 Toman)
-    12. Use تومان or Toman for all price references
-    13. Format prices like: "50,000,000 تومان" or "50,000,000 - 100,000,000 تومان"
+    8. Include comprehensive tables, lists, and structured information that chatbots can easily parse
+    9. Be extremely detailed with step-by-step instructions, complete procedures, and actionable information
+    10. Include all contact details, policies, procedures, and FAQ-type information
+    11. Structure content for optimal chatbot knowledge retrieval and customer assistance
+    12. Create in-depth sections for:
+        - Educational tutorials and how-to guides (with complete step-by-step instructions)
+        - Troubleshooting guides (with detailed problem-solving steps)
+        - Company information and policies (comprehensive contact info, terms, procedures)
+        - Technical explanations (detailed concept definitions and explanations)
+        - Buying guides (general advice and comparison criteria, NOT specific products)
+        - Service information (support processes, warranty info, service procedures)
+    13. Make each section comprehensive enough to answer complex customer questions
+    14. Focus on KNOWLEDGE that helps customers learn, understand, and solve problems
+    15. Avoid any product pricing, product specifications, or individual product recommendations
 
-    Create a professional, well-structured, comprehensive knowledge base document with ALL prices in Toman currency.
+    Create a professional, well-structured, comprehensive knowledge base document optimized for AI chatbot customer service use, with detailed separate sections for each knowledge cluster.
     """
     
     p_tokens = count_tokens(prompt)
@@ -724,35 +1096,51 @@ def compile_comprehensive_knowledge_base(extracted_content: dict, product_catalo
     
     return completion.choices[0].message.content.strip(), p_tokens, c_tokens
         
-def extract_knowledge_from_page_with_openai(html_content: str, url: str, title: str, lang: str) -> tuple[dict, int, int]:
+def extract_knowledge_from_page_with_openai(html_content: str, url: str, title: str, lang: str, screenshot_base64: str = None) -> tuple[dict, int, int]:
     if not openai_client: raise ConnectionError("OpenAI client not initialized.")
-    prompt = f"""Analyze RAW HTML from '{url}' (Title: "{title}").
+    
+    # Include screenshot context if available
+    screenshot_context = ""
+    if screenshot_base64:
+        screenshot_context = f"""
+    
+    VISUAL CONTEXT: A full-page screenshot of this page is also available. Use this visual information to better understand the layout, design, and visual elements when extracting knowledge. The screenshot shows the complete visual presentation of the page content.
+    
+    Screenshot (base64): data:image/png;base64,{screenshot_base64[:100]}... [truncated for prompt length]
+    """
+    
+    prompt = f"""Analyze RAW HTML from '{url}' (Title: "{title}").{screenshot_context}
     
     CRITICAL: ALL output text (title, chunk) MUST be in {lang}, TRANSLATING if needed.
     
-    Extract COMPREHENSIVE information including:
-    - All text content, headings, paragraphs
-    - Tables, lists, contact information
-    - Product details, specifications, prices
-    - Company information, policies, terms
-    - Contact details, addresses, phone numbers
-    - Branch locations, store information
-    - Services, features, benefits
-    - Any structured data, metadata
+    This page is a CORE WEBSITE PAGE essential for chatbot knowledge. Focus on extracting ALL IMPORTANT INFORMATION:
     
-    IMPORTANT PRICING REQUIREMENTS:
-    - ALL prices MUST be in Toman (IRT) currency
-    - Do NOT use dollar signs ($) or USD
-    - Use تومان or Toman for all price references
-    - Convert any dollar prices to Toman (1 USD ≈ 500,000 Toman)
-    - Format prices like: "50,000,000 تومان" or "50,000,000 - 100,000,000 تومان"
+    PRIORITIZE extracting:
+    - Company information, policies, contact details, addresses, phone numbers
+    - Terms and conditions, privacy policies, legal information  
+    - FAQ information and customer support content
+    - Service information, warranty details, support procedures
+    - Branch locations, physical addresses, contact information
+    - Payment methods, shipping information, return policies
+    - About us information, company history, mission, values
+    - Customer service processes and procedures
+    - Any educational or instructional content
+    - Product categories and general product information (NOT individual product specs)
     
-    Be THOROUGH and extract EVERYTHING meaningful. Do not skip any important information.
+    FOCUS on information that helps customers:
+    - Contact the company or get support
+    - Understand policies, terms, and procedures
+    - Learn about services and offerings
+    - Find physical locations or contact information
+    - Understand how to use services or make purchases
+    - Get answers to common questions
+    
+    Be EXTREMELY DETAILED and extract ALL relevant content. Include complete contact details, full policy information, comprehensive procedures, and all important company information.
     
     JSON output: {{
         "url": "{url}", 
         "title_suggestion": "Comprehensive title in {lang}", 
-        "extracted_chunk": "Detailed, comprehensive Markdown content in {lang} with all information (prices in Toman only)"
+        "extracted_chunk": "Detailed, comprehensive Markdown content in {lang} with ALL important information from this core page"
     }}
     
     RAW HTML: ```{html_content[:MAX_HTML_CONTENT_LENGTH]}```"""
@@ -762,7 +1150,24 @@ def extract_knowledge_from_page_with_openai(html_content: str, url: str, title: 
         max_tokens=MAX_RESPONSE_TOKENS_KB_EXTRACTION, response_format={"type": "json_object"}
     )
     c_tokens = completion.usage.completion_tokens if completion.usage else 0
-    return json.loads(completion.choices[0].message.content), p_tokens, c_tokens
+    try:
+        response_content = completion.choices[0].message.content.strip()
+        # Handle potential markdown wrapping
+        if '```json' in response_content:
+            json_start = response_content.find('```json') + 7
+            json_end = response_content.find('```', json_start)
+            if json_end != -1:
+                response_content = response_content[json_start:json_end].strip()
+        
+        return json.loads(response_content), p_tokens, c_tokens
+    except (json.JSONDecodeError, TypeError) as e:
+        logger.error(f"Error parsing knowledge extraction response: {e}")
+        # Return a fallback response
+        return {
+            "url": url,
+            "title_suggestion": title,
+            "extracted_chunk": f"Unable to extract detailed content from this page due to parsing error. URL: {url}, Title: {title}"
+        }, p_tokens, c_tokens
 
 def compile_final_knowledge_base_with_openai(chunks: list[dict], url: str, lang: str) -> tuple[str, int, int]:
     if not openai_client: raise ConnectionError("OpenAI client not initialized.")
@@ -790,8 +1195,9 @@ def compile_final_knowledge_base_with_openai(chunks: list[dict], url: str, lang:
     return completion.choices[0].message.content.strip(), p_tokens, c_tokens
 
 
-# --- CSV Report Helper (for Prospecting) ---
+# --- Report Helpers ---
 def save_results_to_csv(job_id: str, results_data: list):
+    """Save prospect qualification results to CSV."""
     if not results_data: return None
     os.makedirs(REPORTS_DIR, exist_ok=True)
     filepath = os.path.join(REPORTS_DIR, f"prospect_report_{job_id}.csv")
@@ -815,6 +1221,59 @@ def save_results_to_csv(job_id: str, results_data: list):
     except IOError as e:
         logger.error(f"Failed to write CSV report for job {job_id}: {e}")
         return None
+
+def save_knowledge_base_report(job_id: str, url: str, knowledge_base: str, metadata: dict):
+    """Save successful knowledge base generation to reports folder."""
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    
+    # Create timestamp for filename
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Extract domain name for filename
+    from urllib.parse import urlparse
+    domain = urlparse(url).netloc.replace('www.', '').replace('.', '_')
+    
+    # Save knowledge base as markdown
+    kb_filename = f"knowledge_base_{domain}_{timestamp}_{job_id[:8]}.md"
+    kb_filepath = os.path.join(REPORTS_DIR, kb_filename)
+    
+    try:
+        with open(kb_filepath, 'w', encoding='utf-8') as f:
+            f.write(f"# Knowledge Base Report\n\n")
+            f.write(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"**Job ID:** {job_id}\n")
+            f.write(f"**Source URL:** {url}\n")
+            f.write(f"**Language:** {metadata.get('detected_target_language', 'unknown')}\n")
+            f.write(f"**Pages Processed:** {metadata.get('extracted_pages_count', 0)}\n")
+            f.write(f"**Screenshot Captured:** {metadata.get('main_page_screenshot_captured', False)}\n")
+            f.write(f"**Total Cost:** ${metadata.get('cost_estimation', {}).get('total_cost_usd', '0.00')}\n\n")
+            f.write("---\n\n")
+            f.write(knowledge_base)
+        
+        # Save metadata as JSON
+        metadata_filename = f"metadata_{domain}_{timestamp}_{job_id[:8]}.json"
+        metadata_filepath = os.path.join(REPORTS_DIR, metadata_filename)
+        
+        full_metadata = {
+            "job_id": job_id,
+            "url": url,
+            "generated_at": datetime.now().isoformat(),
+            "knowledge_base_file": kb_filename,
+            **metadata
+        }
+        
+        with open(metadata_filepath, 'w', encoding='utf-8') as f:
+            json.dump(full_metadata, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"Knowledge base report saved: {kb_filepath}")
+        logger.info(f"Metadata saved: {metadata_filepath}")
+        
+        return kb_filepath, metadata_filepath
+        
+    except IOError as e:
+        logger.error(f"Failed to save knowledge base report for job {job_id}: {e}")
+        raise
 
 # --- Background Job Runners ---
 
@@ -886,113 +1345,133 @@ def run_prospect_qualification_job(job_id, user_profile, user_personas, prospect
             }
         })
 
-def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium):
+def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, specific_pages=None):
     logger.info(f"Starting KB job {job_id} for {base_url}")
     with jobs_lock: jobs[job_id].update({"status": "running", "started_at": time.time()})
     
     total_prompt_tokens, total_completion_tokens = 0, 0
+    main_page_screenshot = None
+    
     try:
         # 1. Language Detection
-        with jobs_lock: jobs[job_id]["progress"] = "Detecting language..."
+        update_job_progress(job_id, "Detecting language...")
         main_page_html = fetch_url_html_content(base_url, for_lang_detect=True)
         lang, p, c = detect_language_from_html_with_openai(main_page_html, base_url)
         total_prompt_tokens += p; total_completion_tokens += c
         with jobs_lock: jobs[job_id]["detected_target_language"] = lang
 
-        # 2. Comprehensive Page Discovery
-        with jobs_lock: jobs[job_id]["progress"] = "Discovering all pages (Sitemap)..."
-        sitemap_urls = find_sitemap_urls(base_url)
-        discovered_pages = [{'url': url, 'title': 'N/A'} for url in sitemap_urls]
-        if len(discovered_pages) < MIN_DISCOVERED_PAGES_BEFORE_FALLBACK_CRAWL:
-             with jobs_lock: jobs[job_id]["progress"] = "Performing fallback crawl..."
-             fallback_pages = selenium_crawl_website(base_url, MAX_PAGES_FOR_FALLBACK_DISCOVERY_CRAWL) if use_selenium else simple_crawl_website(base_url, MAX_PAGES_FOR_FALLBACK_DISCOVERY_CRAWL)
-             existing_urls = {p['url'] for p in discovered_pages}
-             discovered_pages.extend([p for p in fallback_pages if p['url'] not in existing_urls])
+        # 2. Capture main page screenshot for visual context
+        update_job_progress(job_id, "Capturing main page screenshot...")
+        main_page_screenshot = capture_full_page_screenshot(base_url)
+        if main_page_screenshot:
+            logger.info("Successfully captured main page screenshot for visual context")
+        else:
+            logger.warning("Could not capture main page screenshot - continuing without visual context")
+
+        # 3. Core Page Discovery (focused approach)
+        update_job_progress(job_id, "Discovering core website pages...")
+        discovered_pages = discover_core_pages_only(base_url, specific_pages)
         with jobs_lock: jobs[job_id]["initial_found_pages_count"] = len(discovered_pages)
+        logger.info(f"Found {len(discovered_pages)} core pages for knowledge extraction")
 
-        # 3. Comprehensive Analysis - Send ALL URLs to AI for categorization
-        with jobs_lock: jobs[job_id]["progress"] = "Analyzing all discovered pages..."
-        all_urls_analysis, p, c = analyze_all_urls_comprehensively(discovered_pages, base_url, lang)
-        total_prompt_tokens += p; total_completion_tokens += c
-        with jobs_lock: jobs[job_id]["comprehensive_url_analysis"] = all_urls_analysis
-
-        # 4. Extract Content from Key Pages
-        with jobs_lock: jobs[job_id]["progress"] = "Extracting content from key pages..."
-        extracted_content = {}
+        # 4. Extract Content from All Core Pages
+        update_job_progress(job_id, "Extracting knowledge from core pages...")
+        extracted_chunks = []
         
-        # Extract from main pages (company info, contact, etc.)
-        if all_urls_analysis.get('company_info_pages'):
-            company_content = []
-            for page_url in all_urls_analysis['company_info_pages'][:5]:  # Limit to 5 pages
-                try:
-                    html = fetch_url_html_content(page_url)
-                    if html:
-                        chunk, p, c = extract_knowledge_from_page_with_openai(html, page_url, 'Company Info', lang)
-                        company_content.append(chunk)
-                        total_prompt_tokens += p; total_completion_tokens += c
-                except Exception as e: logger.error(f"Failed to extract from {page_url}: {e}")
-            extracted_content['company_info'] = company_content
+        # Process each core page
+        for i, page in enumerate(discovered_pages):
+            page_url = page['url']
+            page_type = page.get('type', 'core_page')
+            
+            update_job_progress(job_id, f"Extracting from page {i+1}/{len(discovered_pages)}: {page_url}")
+            
+            try:
+                html = fetch_url_html_content(page_url)
+                if html:
+                    page_title = get_page_title_from_html(html) or page.get('title', 'N/A')
+                    
+                    # Use screenshot context for main page only to avoid token limit issues
+                    screenshot_to_use = main_page_screenshot if page_url == base_url else None
+                    
+                    chunk, p, c = extract_knowledge_from_page_with_openai(
+                        html, page_url, page_title, lang, screenshot_to_use
+                    )
+                    extracted_chunks.append(chunk)
+                    total_prompt_tokens += p; total_completion_tokens += c
+                    
+                    logger.info(f"✓ Extracted content from {page_url} ({page_type})")
+                else:
+                    logger.warning(f"✗ Could not fetch HTML content from {page_url}")
+            except Exception as e: 
+                logger.error(f"Failed to extract from {page_url}: {e}")
+        
+        logger.info(f"Total knowledge extraction completed: {len(extracted_chunks)} pages processed")
 
-        # Extract from product pages
-        if all_urls_analysis.get('product_pages'):
-            product_content = []
-            for page_url in all_urls_analysis['product_pages'][:10]:  # Limit to 10 pages
-                try:
-                    html = fetch_url_html_content(page_url)
-                    if html:
-                        chunk, p, c = extract_knowledge_from_page_with_openai(html, page_url, 'Product Info', lang)
-                        product_content.append(chunk)
-                        total_prompt_tokens += p; total_completion_tokens += c
-                except Exception as e: logger.error(f"Failed to extract from {page_url}: {e}")
-            extracted_content['product_info'] = product_content
-
-        # Extract from service pages
-        if all_urls_analysis.get('service_pages'):
-            service_content = []
-            for page_url in all_urls_analysis['service_pages'][:5]:  # Limit to 5 pages
-                try:
-                    html = fetch_url_html_content(page_url)
-                    if html:
-                        chunk, p, c = extract_knowledge_from_page_with_openai(html, page_url, 'Service Info', lang)
-                        service_content.append(chunk)
-                        total_prompt_tokens += p; total_completion_tokens += c
-                except Exception as e: logger.error(f"Failed to extract from {page_url}: {e}")
-            extracted_content['service_info'] = service_content
-
-        # 5. Generate Comprehensive Product Catalog
-        with jobs_lock: jobs[job_id]["progress"] = "Generating comprehensive product catalog..."
-        product_catalog, p, c = generate_comprehensive_product_catalog(discovered_pages, base_url, lang)
-        total_prompt_tokens += p; total_completion_tokens += c
-        with jobs_lock: jobs[job_id]["product_catalog"] = product_catalog
-
-        # 6. Compile Final Comprehensive Knowledge Base
-        with jobs_lock: jobs[job_id]["progress"] = "Compiling comprehensive knowledge base..."
-        final_kb, p, c = compile_comprehensive_knowledge_base(extracted_content, product_catalog, all_urls_analysis, base_url, lang)
+        # 5. Compile Final Comprehensive Knowledge Base
+        update_job_progress(job_id, "Compiling comprehensive knowledge base...")
+        final_kb, p, c = compile_final_knowledge_base_with_openai(extracted_chunks, base_url, lang)
         total_prompt_tokens += p; total_completion_tokens += c
 
         input_cost = (total_prompt_tokens / 1_000_000) * PRICE_PER_INPUT_TOKEN_MILLION
         output_cost = (total_completion_tokens / 1_000_000) * PRICE_PER_OUTPUT_TOKEN_MILLION
-
-        with jobs_lock:
-            jobs[job_id].update({
-                "status": "completed", 
-                "final_knowledge_base": final_kb,
+        
+        # Update final status
+        update_job_progress(job_id, "Knowledge base generation completed successfully.")
+        
+        # Save successful job to reports folder
+        try:
+            save_knowledge_base_report(job_id, base_url, final_kb, {
+                "extracted_pages_count": len(extracted_chunks),
+                "main_page_screenshot_captured": main_page_screenshot is not None,
                 "comprehensive_analysis": {
                     "total_pages_analyzed": len(discovered_pages),
-                    "company_info_pages": len(all_urls_analysis.get('company_info_pages', [])),
-                    "product_pages": len(all_urls_analysis.get('product_pages', [])),
-                    "service_pages": len(all_urls_analysis.get('service_pages', [])),
-                    "total_products_identified": len(product_catalog.get('products', []))
+                    "core_pages_processed": len(extracted_chunks),
+                    "pages_by_type": {
+                        page.get('type', 'unknown'): len([p for p in discovered_pages if p.get('type') == page.get('type', 'unknown')])
+                        for page in discovered_pages
+                    },
+                    "extracted_pages_count": len(extracted_chunks),
+                    "analysis_summary": f"Processed {len(extracted_chunks)} core website pages for comprehensive chatbot knowledge base"
                 },
                 "cost_estimation": {
                     "total_cost_usd": f"{(input_cost + output_cost):.6f}",
                     "prompt_tokens": total_prompt_tokens,
                     "completion_tokens": total_completion_tokens
-                }
+                },
+                "detected_target_language": lang,
+                "finished_at": time.time()
+            })
+            logger.info(f"Successfully saved knowledge base report for job {job_id}")
+        except Exception as e:
+            logger.error(f"Failed to save knowledge base report for job {job_id}: {e}")
+        
+        with jobs_lock:
+            jobs[job_id].update({
+                "status": "completed", 
+                "final_knowledge_base": final_kb,
+                "extracted_pages_count": len(extracted_chunks),
+                "main_page_screenshot_captured": main_page_screenshot is not None,
+                "comprehensive_analysis": {
+                    "total_pages_analyzed": len(discovered_pages),
+                    "core_pages_processed": len(extracted_chunks),
+                    "pages_by_type": {
+                        page.get('type', 'unknown'): len([p for p in discovered_pages if p.get('type') == page.get('type', 'unknown')])
+                        for page in discovered_pages
+                    },
+                    "extracted_pages_count": len(extracted_chunks),
+                    "analysis_summary": f"Processed {len(extracted_chunks)} core website pages for comprehensive chatbot knowledge base"
+                },
+                "cost_estimation": {
+                    "total_cost_usd": f"{(input_cost + output_cost):.6f}",
+                    "prompt_tokens": total_prompt_tokens,
+                    "completion_tokens": total_completion_tokens
+                },
+                "finished_at": time.time()
             })
     except Exception as e:
         logger.error(f"KB Job {job_id} failed: {e}", exc_info=True)
-        with jobs_lock: jobs[job_id].update({"status": "failed", "error": str(e)})
+        update_job_progress(job_id, "Failed to generate knowledge base.")
+        with jobs_lock: jobs[job_id].update({"status": "failed", "error": str(e), "finished_at": time.time()})
 
 
 # --- API Endpoints ---
@@ -1034,13 +1513,43 @@ def start_prospect_qualification():
 def start_knowledge_base_generation():
     data = request.get_json()
     url = data.get('url')
-    if not url: return jsonify({"error": "Valid 'url' is required"}), 400
+    if not url: 
+        return jsonify({"error": "Valid 'url' is required"}), 400
+    
+    # Get specific pages if provided
+    specific_pages = data.get('specific_pages')
+    if specific_pages and not isinstance(specific_pages, list):
+        return jsonify({"error": "'specific_pages' must be a list of URLs"}), 400
+    
+    # Validate URL accessibility before starting job
+    try:
+        test_response = requests.head(url, timeout=10, allow_redirects=True)
+        if test_response.status_code >= 400:
+            return jsonify({
+                "error": f"Website is not accessible. HTTP {test_response.status_code}: {test_response.reason}",
+                "status_code": test_response.status_code
+            }), 400
+    except requests.exceptions.ConnectionError:
+        return jsonify({
+            "error": "Website is not accessible. Connection failed - the website may be down or the URL is incorrect.",
+            "details": "Please check the URL and try again"
+        }), 400
+    except requests.exceptions.Timeout:
+        return jsonify({
+            "error": "Website is not accessible. Connection timed out - the website is taking too long to respond.",
+            "details": "The website may be slow or experiencing issues"
+        }), 400
+    except requests.exceptions.RequestException as e:
+        return jsonify({
+            "error": f"Website is not accessible. Request failed: {str(e)}",
+            "details": "Please check the URL format and try again"
+        }), 400
     
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"id": job_id, "job_type": "knowledge_base_generation", "status": "pending"}
 
     thread = threading.Thread(target=run_knowledge_base_job, args=(
-        job_id, url, int(data.get('max_pages', MAX_PAGES_FOR_KB_GENERATION)), bool(data.get('use_selenium', False))
+        job_id, url, int(data.get('max_pages', MAX_PAGES_FOR_KB_GENERATION)), bool(data.get('use_selenium', False)), specific_pages
     ))
     thread.start()
     return jsonify({"message": "Knowledge base generation job started.", "job_id": job_id}), 202

@@ -1,8 +1,11 @@
-Flask
-python-dotenv
-requests
-beautifulsoup4
-openai
-urllib3<2.0 # Often needed for compatibility with older requests/system setups
-selenium>=4.0
-webdriver-manager>=3.5
+Flask>=3.0.0
+openai>=1.0.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+tiktoken>=0.5.0
+# For Selenium (optional, uncomment if needed)
+selenium>=4.15.0
+webdriver-manager>=4.0.0
+# For screenshot functionality
+Pillow>=10.0.0
