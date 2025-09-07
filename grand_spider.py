@@ -121,6 +121,7 @@ PROGRESS_MESSAGES_FA = {
     "Failed to generate knowledge base.": "تولید پایگاه دانش با شکست مواجه شد.",
     # New progress messages for improved system
     "Capturing main page screenshot...": "گرفتن تصویر کامل صفحه اصلی...",
+    "Extracting website colors...": "استخراج رنگ‌های وب‌سایت...",
     "Discovering core website pages...": "کشف صفحات اصلی وب‌سایت...",
     "Extracting knowledge from core pages...": "استخراج دانش از صفحات اصلی...",
     "Compiling comprehensive knowledge base...": "تدوین پایگاه دانش جامع...",
@@ -139,8 +140,10 @@ def get_progress_fa(progress_en: str) -> str:
                 # Extract X/Y from the message
                 if "Extracting from page" in page_info:
                     numbers = page_info.replace("Extracting from page", "").strip()
+                    # Ensure the full URL is preserved
                     return f"استخراج از صفحه {numbers}: {url_part}"
-        except:
+        except Exception as e:
+            logger.debug(f"Error processing progress message: {e}")
             pass
     
     # Handle other dynamic messages
@@ -1096,6 +1099,66 @@ def compile_comprehensive_knowledge_base(extracted_content: dict, knowledge_clus
     
     return completion.choices[0].message.content.strip(), p_tokens, c_tokens
         
+def extract_website_colors_with_openai(html_content: str, url: str, screenshot_base64: str = None) -> tuple[dict, int, int]:
+    """Extract website background color and primary brand color using AI analysis."""
+    if not openai_client: 
+        raise ConnectionError("OpenAI client not initialized.")
+    
+    # Include screenshot context if available
+    screenshot_context = ""
+    if screenshot_base64:
+        screenshot_context = f"""
+    
+    VISUAL CONTEXT: A full-page screenshot of this website is available. Use this visual information to identify the main background color and primary brand color from the actual visual appearance of the website.
+    
+    Screenshot (base64): data:image/png;base64,{screenshot_base64[:100]}... [truncated for prompt length]
+    """
+    
+    prompt = f"""Analyze the website at '{url}' to identify its color scheme.{screenshot_context}
+    
+    Your task is to identify:
+    1. Main background color (most common background color used across the website)
+    2. Primary brand color (the main color used for branding, buttons, links, headers, etc.)
+    
+    Look at the HTML content and visual context to determine these colors.
+    
+    Respond with a JSON object:
+    {{
+        "main_background_color": "hex color code (e.g., #ffffff)",
+        "primary_brand_color": "hex color code (e.g., #007bff)",
+        "background_color_description": "Brief description of the background color",
+        "brand_color_description": "Brief description of the brand color and where it's used"
+    }}
+    
+    HTML Content: ```{html_content[:5000]}```"""
+    
+    p_tokens = count_tokens(prompt)
+    completion = openai_client.chat.completions.create(
+        model=OPENAI_MODEL, messages=[{"role": "user", "content": prompt}],
+        max_tokens=300, response_format={"type": "json_object"}
+    )
+    c_tokens = completion.usage.completion_tokens if completion.usage else 0
+    
+    try:
+        response_content = completion.choices[0].message.content.strip()
+        # Handle potential markdown wrapping
+        if '```json' in response_content:
+            json_start = response_content.find('```json') + 7
+            json_end = response_content.find('```', json_start)
+            if json_end != -1:
+                response_content = response_content[json_start:json_end].strip()
+        
+        return json.loads(response_content), p_tokens, c_tokens
+    except (json.JSONDecodeError, TypeError) as e:
+        logger.error(f"Error parsing color extraction response: {e}")
+        # Return a fallback response
+        return {
+            "main_background_color": "#ffffff",
+            "primary_brand_color": "#000000",
+            "background_color_description": "Default white background (fallback)",
+            "brand_color_description": "Default black text (fallback)"
+        }, p_tokens, c_tokens
+
 def extract_knowledge_from_page_with_openai(html_content: str, url: str, title: str, lang: str, screenshot_base64: str = None) -> tuple[dict, int, int]:
     if not openai_client: raise ConnectionError("OpenAI client not initialized.")
     
@@ -1368,6 +1431,24 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
         else:
             logger.warning("Could not capture main page screenshot - continuing without visual context")
 
+        # 2.5. Extract website colors
+        update_job_progress(job_id, "Extracting website colors...")
+        website_colors = None
+        if main_page_html:
+            try:
+                colors, p, c = extract_website_colors_with_openai(main_page_html, base_url, main_page_screenshot)
+                website_colors = colors
+                total_prompt_tokens += p; total_completion_tokens += c
+                logger.info(f"Successfully extracted website colors: {colors.get('main_background_color', 'N/A')} background, {colors.get('primary_brand_color', 'N/A')} brand")
+            except Exception as e:
+                logger.error(f"Failed to extract website colors: {e}")
+                website_colors = {
+                    "main_background_color": "#ffffff",
+                    "primary_brand_color": "#000000",
+                    "background_color_description": "Default fallback",
+                    "brand_color_description": "Default fallback"
+                }
+
         # 3. Core Page Discovery (focused approach)
         update_job_progress(job_id, "Discovering core website pages...")
         discovered_pages = discover_core_pages_only(base_url, specific_pages)
@@ -1423,6 +1504,7 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
             save_knowledge_base_report(job_id, base_url, final_kb, {
                 "extracted_pages_count": len(extracted_chunks),
                 "main_page_screenshot_captured": main_page_screenshot is not None,
+                "website_colors": website_colors,
                 "comprehensive_analysis": {
                     "total_pages_analyzed": len(discovered_pages),
                     "core_pages_processed": len(extracted_chunks),
@@ -1451,6 +1533,7 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
                 "final_knowledge_base": final_kb,
                 "extracted_pages_count": len(extracted_chunks),
                 "main_page_screenshot_captured": main_page_screenshot is not None,
+                "website_colors": website_colors,
                 "comprehensive_analysis": {
                     "total_pages_analyzed": len(discovered_pages),
                     "core_pages_processed": len(extracted_chunks),
