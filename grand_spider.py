@@ -80,7 +80,7 @@ SELENIUM_RENDER_WAIT_SECONDS = 3
 MAX_HTML_CONTENT_LENGTH = 3500000
 MAX_HTML_SNIPPET_FOR_LANG_DETECT = 20000
 MAX_CONTENT_LENGTH = 15000 # For simple text extraction
-OPENAI_MODEL = "gpt-4.1-nano-2025-04-14"
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-nano")
 
 # --- Token Limits for Different Tasks ---
 # For Company Analysis & Prospecting (from Code 1)
@@ -91,8 +91,8 @@ MAX_RESPONSE_TOKENS_PROSPECT = 800
 DEFAULT_TARGET_LANGUAGE = "en"
 MAX_RESPONSE_TOKENS_LANG_DETECT = 50
 MAX_RESPONSE_TOKENS_PAGE_SELECTION = 2000
-MAX_RESPONSE_TOKENS_KB_EXTRACTION = 8000
-MAX_RESPONSE_TOKENS_KB_COMPILATION = 8000
+MAX_RESPONSE_TOKENS_KB_EXTRACTION = 16000
+MAX_RESPONSE_TOKENS_KB_COMPILATION = 16000
 
 # --- Crawling & Discovery Constants ---
 CRAWLER_USER_AGENT = 'GrandSpiderMultiPurposeAnalyzer/2.0 (+http://yourappdomain.com/bot)'
@@ -170,10 +170,10 @@ except Exception as e:
     logger.error(f"Could not initialize tiktoken tokenizer: {e}. Token counting may be inaccurate.")
     TOKENIZER = None
 
-# Using a unified pricing model, assuming GPT-4.1-nano pricing is consistent
-# Prices are per 1 Million tokens
-PRICE_PER_INPUT_TOKEN_MILLION = 0.40
-PRICE_PER_OUTPUT_TOKEN_MILLION = 1.20 # NOTE: This is an assumed price, adjust if official numbers differ.
+# Prices are per 1 Million tokens (gpt-5-nano)
+PRICE_PER_INPUT_TOKEN_MILLION = 0.05
+PRICE_PER_OUTPUT_TOKEN_MILLION = 0.40
+PRICE_PER_CACHED_INPUT_TOKEN_MILLION = 0.005
 
 KB_WRITING_GUIDELINES_TEMPLATE = """
 Guidelines for structuring the knowledge base in {target_language}:
@@ -459,6 +459,13 @@ def fetch_url_html_content(url: str, for_lang_detect=False) -> str | None:
         if not for_lang_detect: raise ConnectionError(f"Failed to fetch URL content: {req_err}") from req_err
     return None
 
+def preprocess_html_for_extraction(html: str) -> str:
+    """Strip noise tags before sending to AI to save tokens."""
+    soup = BeautifulSoup(html, 'html.parser')
+    for tag in soup(["script", "style", "nav", "footer", "header", "noscript", "meta", "link", "svg"]):
+        tag.decompose()
+    return str(soup)[:MAX_HTML_CONTENT_LENGTH]
+
 def fetch_url_content(url: str) -> str:
     """Fetches and extracts clean text content from a URL."""
     headers = {'User-Agent': CRAWLER_USER_AGENT}
@@ -651,20 +658,93 @@ def capture_full_page_screenshot(url: str) -> str | None:
             driver.quit()
 
 
+def scrape_single_page(url: str, use_selenium: bool = False, include_screenshot: bool = False) -> dict:
+    """Synchronously scrape and extract structured knowledge from a single URL."""
+    # Validate URL accessibility
+    try:
+        head_resp = requests.head(url, headers={'User-Agent': CRAWLER_USER_AGENT}, timeout=10, allow_redirects=True)
+        if head_resp.status_code >= 400:
+            raise ValueError(f"URL returned HTTP {head_resp.status_code}")
+    except requests.exceptions.RequestException as e:
+        raise ConnectionError(f"URL is not accessible: {e}") from e
+
+    # Fetch HTML
+    if use_selenium:
+        if not SELENIUM_AVAILABLE:
+            raise RuntimeError("Selenium is not available on this server.")
+        driver = None
+        try:
+            chrome_options = ChromeOptions()
+            chrome_options.add_argument("--headless")
+            chrome_options.add_argument("--no-sandbox")
+            chrome_options.add_argument("--disable-dev-shm-usage")
+            chrome_options.add_argument(f"user-agent={CRAWLER_USER_AGENT}")
+            service = ChromeService(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=chrome_options)
+            driver.set_page_load_timeout(SELENIUM_PAGE_LOAD_TIMEOUT)
+            driver.get(url)
+            WebDriverWait(driver, SELENIUM_PAGE_LOAD_TIMEOUT).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            time.sleep(SELENIUM_RENDER_WAIT_SECONDS)
+            html = driver.page_source
+        finally:
+            if driver:
+                driver.quit()
+    else:
+        html = fetch_url_html_content(url)
+
+    if not html:
+        raise ValueError("Could not fetch HTML content from the URL.")
+
+    # Optionally capture screenshot
+    screenshot_b64 = None
+    screenshot_captured = False
+    if include_screenshot:
+        screenshot_b64 = capture_full_page_screenshot(url)
+        screenshot_captured = screenshot_b64 is not None
+
+    # Detect language
+    html_snippet = html[:MAX_HTML_SNIPPET_FOR_LANG_DETECT]
+    lang, _, _ = detect_language_from_html_with_openai(html_snippet, url)
+
+    # Get page title
+    title = get_page_title_from_html(html)
+
+    # Extract knowledge
+    result, p_tokens, c_tokens = extract_knowledge_from_page_with_openai(html, url, title, lang, screenshot_b64)
+
+    # Compute cost
+    input_cost = (p_tokens / 1_000_000) * PRICE_PER_INPUT_TOKEN_MILLION
+    output_cost = (c_tokens / 1_000_000) * PRICE_PER_OUTPUT_TOKEN_MILLION
+
+    return {
+        "status": "success",
+        "url": url,
+        "title": result.get("title_suggestion", title),
+        "detected_language": lang,
+        "extracted_content": result.get("extracted_chunk", ""),
+        "screenshot_captured": screenshot_captured,
+        "cost_estimation": {
+            "total_cost_usd": f"{(input_cost + output_cost):.6f}",
+            "prompt_tokens": p_tokens,
+            "completion_tokens": c_tokens
+        }
+    }
+
+
 # --- OpenAI Helper Functions (Feature-Specific) ---
 
 # For Company Analysis
 def analyze_single_page_with_openai(page_content: str, url: str) -> str:
     if not openai_client: raise ConnectionError("OpenAI client not initialized.")
     prompt = f"Analyze ONLY the following text content from '{url}'. Describe the page's purpose. Be concise (1-2 sentences). Content: ```{page_content}```"
-    completion = openai_client.chat.completions.create(model=OPENAI_MODEL, messages=[{"role": "user", "content": prompt}], max_tokens=MAX_RESPONSE_TOKENS_PAGE)
+    completion = openai_client.chat.completions.create(model=OPENAI_MODEL, messages=[{"role": "user", "content": prompt}], max_completion_tokens=MAX_RESPONSE_TOKENS_PAGE)
     return completion.choices[0].message.content.strip()
 
 def summarize_company_with_openai(page_summaries: list[dict], root_url: str) -> str:
     if not openai_client: raise ConnectionError("OpenAI client not initialized.")
     combined_text = f"Based on analyses of pages from {root_url}:\n\n" + "\n".join([f"- URL: {s['url']}\n  Summary: {s['description']}" for s in page_summaries])
     prompt = f"Synthesize these descriptions into a comprehensive overview of the company at {root_url}. Describe its main purpose, offerings, and mission. Summaries:\n{combined_text}"
-    completion = openai_client.chat.completions.create(model=OPENAI_MODEL, messages=[{"role": "user", "content": prompt}], max_tokens=MAX_RESPONSE_TOKENS_SUMMARY)
+    completion = openai_client.chat.completions.create(model=OPENAI_MODEL, messages=[{"role": "user", "content": prompt}], max_completion_tokens=MAX_RESPONSE_TOKENS_SUMMARY)
     return completion.choices[0].message.content.strip()
 
 # For Prospect Qualification
@@ -687,7 +767,7 @@ def qualify_prospect_with_openai(page_content: str, prospect_url: str, user_prof
     }}"""
     completion = openai_client.chat.completions.create(
         model=OPENAI_MODEL, messages=[{"role": "user", "content": prompt}],
-        max_tokens=MAX_RESPONSE_TOKENS_PROSPECT, response_format={"type": "json_object"}
+        max_completion_tokens=MAX_RESPONSE_TOKENS_PROSPECT, response_format={"type": "json_object"}
     )
     result_json = json.loads(completion.choices[0].message.content)
     return result_json, completion.usage
@@ -696,13 +776,23 @@ def qualify_prospect_with_openai(page_content: str, prospect_url: str, user_prof
 def detect_language_from_html_with_openai(html_snippet: str, url: str) -> tuple[str, int, int]:
     if not openai_client: raise ConnectionError("OpenAI client not initialized.")
     if not html_snippet or not html_snippet.strip(): return DEFAULT_TARGET_LANGUAGE, 0, 0
-    prompt = f"""From this HTML from {url}, identify the primary visible human language of the MAIN content. 
-    
-    Respond with ONLY the 2-letter ISO language code (e.g., "en" for English, "fa" for Farsi/Persian, "ar" for Arabic, "fr" for French, "de" for German, "es" for Spanish, etc.).
-    
-    HTML: ```{html_snippet}```"""
-    p_tokens = count_tokens(prompt)
-    completion = openai_client.chat.completions.create(model=OPENAI_MODEL, messages=[{"role": "user", "content": prompt}], max_tokens=MAX_RESPONSE_TOKENS_LANG_DETECT)
+    messages = [
+        {
+            "role": "developer",
+            "content": (
+                "You are a language identification tool. "
+                "Your ONLY output is a single 2-letter ISO 639-1 language code. "
+                "No explanations, no punctuation, no extra text. "
+                "Examples of valid outputs: en  fa  ar  fr  de  es  zh  tr"
+            )
+        },
+        {
+            "role": "user",
+            "content": f"Identify the primary language of the visible text content in this HTML:\n\n{html_snippet}"
+        }
+    ]
+    p_tokens = count_tokens(html_snippet)
+    completion = openai_client.chat.completions.create(model=OPENAI_MODEL, messages=messages, max_completion_tokens=MAX_RESPONSE_TOKENS_LANG_DETECT)
     lang = completion.choices[0].message.content.strip().lower()
     c_tokens = completion.usage.completion_tokens if completion.usage else 0
     # Validate it's a proper language code
@@ -778,7 +868,7 @@ def analyze_all_urls_comprehensively(page_details: list[dict], root_url: str, la
     p_tokens = count_tokens(prompt)
     completion = openai_client.chat.completions.create(
         model=OPENAI_MODEL, messages=[{"role": "user", "content": prompt}],
-        max_tokens=MAX_RESPONSE_TOKENS_PAGE_SELECTION * 2, response_format={"type": "json_object"}
+        max_completion_tokens=MAX_RESPONSE_TOKENS_PAGE_SELECTION * 2, response_format={"type": "json_object"}
     )
     c_tokens = completion.usage.completion_tokens if completion.usage else 0
     
@@ -881,91 +971,61 @@ def identify_knowledge_rich_content_clusters(page_details: list[dict], root_url:
         logger.info(f"Prioritized {len(urls_list)} URLs for knowledge analysis: {len(high_value_urls)} high-value, {len(medium_value_urls)} medium-value, {len(low_value_urls)} low-value")
     
     urls_text = "\n".join([f"- {url}" for url in urls_list])
-    
-    # Create language-appropriate prompts and descriptions
-    if lang == 'fa':
-        cluster_descriptions = {
-            "educational_content": "محتوای آموزشی، راهنماها و آموزش‌های فنی",
-            "buying_guides": "راهنماهای خرید، مقایسه و توصیه‌ها",
-            "technical_explanations": "تعاریف مفاهیم و توضیحات فنی",
-            "troubleshooting_support": "محتوای حل مشکل و پشتیبانی",
-            "company_information": "درباره شرکت، تماس، سیاست‌ها و اطلاعات شرکت",
-            "service_information": "خدمات، فرآیندهای پشتیبانی و ویژگی‌ها"
-        }
-        prompt_lang_instruction = f"CRITICAL: ALL descriptions and analysis_summary MUST be written in Persian/Farsi ({lang}), not English."
-    else:
-        cluster_descriptions = {
-            "educational_content": "Tutorial, how-to, and educational content",
-            "buying_guides": "Comparison guides and recommendations", 
-            "technical_explanations": "Concept definitions and technical explanations",
-            "troubleshooting_support": "Problem-solving and support content",
-            "company_information": "About, contact, policies, and company info",
-            "service_information": "Services, support processes, and features"
-        }
-        prompt_lang_instruction = f"CRITICAL: ALL descriptions and analysis_summary MUST be written in {lang}."
 
-    prompt = f"""Analyze the following URLs from {root_url} and identify KNOWLEDGE-RICH CONTENT CLUSTERS for chatbot training.
+    cluster_descriptions = {
+        "educational_content": "Tutorial, how-to, and educational content",
+        "buying_guides": "Comparison guides and recommendations",
+        "technical_explanations": "Concept definitions and technical explanations",
+        "troubleshooting_support": "Problem-solving and support content",
+        "company_information": "About, contact, policies, and company info",
+        "service_information": "Services, support processes, and features"
+    }
 
-Your goal is to find pages that contain valuable information for customer service, education, and support - STRICTLY AVOID individual product pages.
+    messages = [
+        {
+            "role": "developer",
+            "content": (
+                f"You are a URL categorization tool for chatbot knowledge extraction. "
+                f"Classify URLs into knowledge-rich content clusters. "
+                f"All descriptions and analysis_summary MUST be written in {lang}. "
+                f"Output ONLY valid JSON matching the schema provided. "
+                f"Strictly avoid individual product pages, cart, checkout, account, admin, and asset URLs."
+            )
+        },
+        {
+            "role": "user",
+            "content": f"""Categorize these URLs from {root_url} into knowledge-rich clusters for chatbot training.
 
-PRIORITIZE these types of content clusters:
+Clusters to identify:
+1. educational_content — how-to guides, tutorials, installation, setup instructions
+2. buying_guides — comparisons, decision guides, best-practices (not individual products)
+3. technical_explanations — concept definitions, feature explanations, what-is pages
+4. troubleshooting_support — problem-solving, error fixes, tips
+5. company_information — about, contact, policies, terms, branch locations
+6. service_information — services offered, support processes, warranty info
 
-1. **Educational/Tutorial Content**: How-to guides, tutorials, installation guides, setup instructions
-2. **Buying Guides/Recommendations**: Best practices, comparisons, decision-making guides (NOT individual products)
-3. **Technical Explanations**: What-is pages, concept definitions, feature explanations
-4. **Troubleshooting/Support**: Problem-solving guides, error fixes, tips and tricks
-5. **Company Information**: About pages, contact info, policies, terms, branch locations
-6. **Service Information**: Services offered, support processes, warranty info
-
-STRICTLY AVOID:
-- Individual product listing pages (like /product/specific-item)
-- Shopping cart/checkout pages
-- User account pages
-- Technical/admin pages
-- Product catalog pages
-
-Focus on KNOWLEDGE and SUPPORT content that helps customers understand, learn, and solve problems.
-
-{prompt_lang_instruction}
-
-URLs to analyze:
+URLs:
 {urls_text}
 
-Respond with a JSON object categorizing URLs into knowledge-rich clusters:
+Output this JSON schema:
 {{
-    "educational_content": {{
-        "urls": ["url1", "url2", ...],
-        "description": "{cluster_descriptions['educational_content']}"
-    }},
-    "buying_guides": {{
-        "urls": ["url1", "url2", ...],
-        "description": "{cluster_descriptions['buying_guides']}"
-    }},
-    "technical_explanations": {{
-        "urls": ["url1", "url2", ...],
-        "description": "{cluster_descriptions['technical_explanations']}"
-    }},
-    "troubleshooting_support": {{
-        "urls": ["url1", "url2", ...],
-        "description": "{cluster_descriptions['troubleshooting_support']}"
-    }},
-    "company_information": {{
-        "urls": ["url1", "url2", ...],
-        "description": "{cluster_descriptions['company_information']}"
-    }},
-    "service_information": {{
-        "urls": ["url1", "url2", ...],
-        "description": "{cluster_descriptions['service_information']}"
-    }},
-    "priority_extraction_order": ["cluster_name1", "cluster_name2", ...],
-    "total_knowledge_pages_identified": number,
-    "analysis_summary": "Brief summary of knowledge content found (in {lang})"
+    "educational_content": {{"urls": [...], "description": "{cluster_descriptions['educational_content']}"}},
+    "buying_guides": {{"urls": [...], "description": "{cluster_descriptions['buying_guides']}"}},
+    "technical_explanations": {{"urls": [...], "description": "{cluster_descriptions['technical_explanations']}"}},
+    "troubleshooting_support": {{"urls": [...], "description": "{cluster_descriptions['troubleshooting_support']}"}},
+    "company_information": {{"urls": [...], "description": "{cluster_descriptions['company_information']}"}},
+    "service_information": {{"urls": [...], "description": "{cluster_descriptions['service_information']}"}},
+    "priority_extraction_order": ["cluster_name1", ...],
+    "total_knowledge_pages_identified": <number>,
+    "analysis_summary": "<brief summary in {lang}>"
 }}"""
-    
-    p_tokens = count_tokens(prompt)
+        }
+    ]
+
+    p_tokens = count_tokens(urls_text)
     completion = openai_client.chat.completions.create(
-        model=OPENAI_MODEL, messages=[{"role": "user", "content": prompt}],
-        max_tokens=MAX_RESPONSE_TOKENS_PAGE_SELECTION * 2, response_format={"type": "json_object"}
+        model=OPENAI_MODEL, messages=messages,
+        max_completion_tokens=MAX_RESPONSE_TOKENS_PAGE_SELECTION * 2, response_format={"type": "json_object"}
     )
     c_tokens = completion.usage.completion_tokens if completion.usage else 0
     
@@ -1093,10 +1153,10 @@ def compile_comprehensive_knowledge_base(extracted_content: dict, knowledge_clus
     p_tokens = count_tokens(prompt)
     completion = openai_client.chat.completions.create(
         model=OPENAI_MODEL, messages=[{"role": "user", "content": prompt}],
-        max_tokens=MAX_RESPONSE_TOKENS_KB_COMPILATION
+        max_completion_tokens=MAX_RESPONSE_TOKENS_KB_COMPILATION
     )
     c_tokens = completion.usage.completion_tokens if completion.usage else 0
-    
+
     return completion.choices[0].message.content.strip(), p_tokens, c_tokens
         
 def extract_website_colors_with_openai(html_content: str, url: str, screenshot_base64: str = None) -> tuple[dict, int, int]:
@@ -1161,71 +1221,78 @@ def extract_website_colors_with_openai(html_content: str, url: str, screenshot_b
 
 def extract_knowledge_from_page_with_openai(html_content: str, url: str, title: str, lang: str, screenshot_base64: str = None) -> tuple[dict, int, int]:
     if not openai_client: raise ConnectionError("OpenAI client not initialized.")
-    
-    # Include screenshot context if available
-    screenshot_context = ""
+
+    preprocessed_html = preprocess_html_for_extraction(html_content)
+
+    user_content_parts = [
+        {
+            "type": "text",
+            "text": f"""Extract all knowledge from this webpage.
+
+URL: {url}
+Page Title: {title}
+
+Extract and structure the following into the JSON response:
+- Contact details (phone, email, address, social links)
+- Company background (history, mission, team)
+- Policies (shipping, returns, privacy, terms, warranty)
+- Services and service procedures
+- FAQ content (question + answer pairs)
+- Branch/location information
+- Payment methods and checkout process
+- Any educational or instructional content
+
+Output this exact JSON schema:
+{{
+  "url": "{url}",
+  "title_suggestion": "<descriptive page title in {lang}>",
+  "extracted_chunk": "<comprehensive Markdown document in {lang} covering ALL extracted information>"
+}}
+
+HTML:
+```{preprocessed_html}```"""
+        }
+    ]
+
     if screenshot_base64:
-        screenshot_context = f"""
-    
-    VISUAL CONTEXT: A full-page screenshot of this page is also available. Use this visual information to better understand the layout, design, and visual elements when extracting knowledge. The screenshot shows the complete visual presentation of the page content.
-    
-    Screenshot (base64): data:image/png;base64,{screenshot_base64[:100]}... [truncated for prompt length]
-    """
-    
-    prompt = f"""Analyze RAW HTML from '{url}' (Title: "{title}").{screenshot_context}
-    
-    CRITICAL: ALL output text (title, chunk) MUST be in {lang}, TRANSLATING if needed.
-    
-    This page is a CORE WEBSITE PAGE essential for chatbot knowledge. Focus on extracting ALL IMPORTANT INFORMATION:
-    
-    PRIORITIZE extracting:
-    - Company information, policies, contact details, addresses, phone numbers
-    - Terms and conditions, privacy policies, legal information  
-    - FAQ information and customer support content
-    - Service information, warranty details, support procedures
-    - Branch locations, physical addresses, contact information
-    - Payment methods, shipping information, return policies
-    - About us information, company history, mission, values
-    - Customer service processes and procedures
-    - Any educational or instructional content
-    - Product categories and general product information (NOT individual product specs)
-    
-    FOCUS on information that helps customers:
-    - Contact the company or get support
-    - Understand policies, terms, and procedures
-    - Learn about services and offerings
-    - Find physical locations or contact information
-    - Understand how to use services or make purchases
-    - Get answers to common questions
-    
-    Be EXTREMELY DETAILED and extract ALL relevant content. Include complete contact details, full policy information, comprehensive procedures, and all important company information.
-    
-    JSON output: {{
-        "url": "{url}", 
-        "title_suggestion": "Comprehensive title in {lang}", 
-        "extracted_chunk": "Detailed, comprehensive Markdown content in {lang} with ALL important information from this core page"
-    }}
-    
-    RAW HTML: ```{html_content[:MAX_HTML_CONTENT_LENGTH]}```"""
-    p_tokens = count_tokens(prompt)
+        user_content_parts.insert(0, {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{screenshot_base64}", "detail": "low"}
+        })
+
+    messages = [
+        {
+            "role": "developer",
+            "content": (
+                f"You are a knowledge extraction engine for chatbot training data. "
+                f"Extract all customer-relevant information from website HTML. "
+                f"Output language: {lang}. Translate content if needed. "
+                f"Output ONLY valid JSON matching the schema provided."
+            )
+        },
+        {
+            "role": "user",
+            "content": user_content_parts
+        }
+    ]
+
+    p_tokens = count_tokens(preprocessed_html)
     completion = openai_client.chat.completions.create(
-        model=OPENAI_MODEL, messages=[{"role": "user", "content": prompt}],
-        max_tokens=MAX_RESPONSE_TOKENS_KB_EXTRACTION, response_format={"type": "json_object"}
+        model=OPENAI_MODEL, messages=messages,
+        max_completion_tokens=MAX_RESPONSE_TOKENS_KB_EXTRACTION, response_format={"type": "json_object"}
     )
     c_tokens = completion.usage.completion_tokens if completion.usage else 0
     try:
         response_content = completion.choices[0].message.content.strip()
-        # Handle potential markdown wrapping
         if '```json' in response_content:
             json_start = response_content.find('```json') + 7
             json_end = response_content.find('```', json_start)
             if json_end != -1:
                 response_content = response_content[json_start:json_end].strip()
-        
+
         return json.loads(response_content), p_tokens, c_tokens
     except (json.JSONDecodeError, TypeError) as e:
         logger.error(f"Error parsing knowledge extraction response: {e}")
-        # Return a fallback response
         return {
             "url": url,
             "title_suggestion": title,
@@ -1236,24 +1303,48 @@ def compile_final_knowledge_base_with_openai(chunks: list[dict], url: str, lang:
     if not openai_client: raise ConnectionError("OpenAI client not initialized.")
     guidelines = KB_WRITING_GUIDELINES_TEMPLATE.format(target_language=lang)
     chunks_text = "\n\n".join([f"--- Chunk from {c.get('url', 'N/A')} ---\nTitle: {c.get('title_suggestion', 'N/A')}\nContent:\n{c.get('extracted_chunk', 'N/A')}" for c in chunks])
-    prompt = f"""Compile a COMPREHENSIVE and DETAILED knowledge base from these chunks from {url}. Chunks are already in {lang}.
-    
-    Guidelines:\n{guidelines}
-    
-    IMPORTANT REQUIREMENTS:
-    - Create a VERY DETAILED and COMPREHENSIVE knowledge base
-    - Include ALL information from all chunks
-    - Organize information logically with clear sections
-    - Include tables, lists, contact details, product information
-    - Make it as complete and thorough as possible
-    - Do not omit any important information
-    - Create a professional, well-structured document
-    
-    Synthesize into a single, coherent, comprehensive Markdown document in {lang}.
-    
-    Combined Chunks:\n{chunks_text}"""
-    p_tokens = count_tokens(prompt)
-    completion = openai_client.chat.completions.create(model=OPENAI_MODEL, messages=[{"role": "user", "content": prompt}], max_tokens=MAX_RESPONSE_TOKENS_KB_COMPILATION)
+    messages = [
+        {
+            "role": "developer",
+            "content": (
+                f"You are a technical writer creating a structured knowledge base in {lang}. "
+                f"Synthesize multiple page extracts into a single, deduplicated Markdown document. "
+                f"Remove duplicate information. Resolve conflicts by keeping the most complete version."
+            )
+        },
+        {
+            "role": "user",
+            "content": f"""Compile these page extracts from {url} into one cohesive knowledge base.
+
+Required document structure (use ## for each section that has data):
+## Company Overview
+## Contact Information
+## Products & Services
+## Policies (Shipping / Returns / Warranty / Privacy / Terms)
+## FAQ
+## How to Order / Payment Methods
+## Support & Troubleshooting
+## Additional Information
+
+Rules:
+- Write entirely in {lang}
+- Deduplicate: merge repeated information, do not list the same fact twice
+- Use tables where data is tabular
+- Use numbered lists for step-by-step processes
+- Include all phone numbers, addresses, emails verbatim
+- Include all policy clauses verbatim (do not paraphrase legal text)
+
+Guidelines:
+{guidelines}
+
+Page extracts:
+{chunks_text}"""
+        }
+    ]
+    p_tokens = count_tokens(chunks_text)
+    completion = openai_client.chat.completions.create(
+        model=OPENAI_MODEL, messages=messages, max_completion_tokens=MAX_RESPONSE_TOKENS_KB_COMPILATION
+    )
     c_tokens = completion.usage.completion_tokens if completion.usage else 0
     return completion.choices[0].message.content.strip(), p_tokens, c_tokens
 
@@ -1661,6 +1752,32 @@ def analyze_html_file():
         return jsonify({"status": "success", "filename": file.filename, "elements": elements_map}), 200
     except Exception as e:
         return jsonify({"error": "Internal Server Error", "message": str(e)}), 500
+
+@app.route('/api/scrape-page', methods=['POST'])
+@require_api_key
+def scrape_page():
+    data = request.get_json()
+    url = data.get('url')
+    if not url:
+        return jsonify({"error": "'url' is required"}), 400
+
+    use_selenium = bool(data.get('use_selenium', False))
+    include_screenshot = bool(data.get('include_screenshot', False))
+
+    if not openai_client:
+        return jsonify({"error": "OpenAI client is not configured"}), 500
+
+    try:
+        result = scrape_single_page(url, use_selenium=use_selenium, include_screenshot=include_screenshot)
+        return jsonify(result), 200
+    except (ConnectionError, ValueError) as e:
+        return jsonify({"error": "URL is not accessible", "details": str(e)}), 400
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"Unexpected error in /api/scrape-page for {url}: {e}", exc_info=True)
+        return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
+
 
 @app.route('/api/jobs/<job_id>', methods=['GET'])
 @require_api_key

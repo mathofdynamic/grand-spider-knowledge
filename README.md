@@ -2,7 +2,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.7+-blue.svg" alt="Python 3.7+">
-  <img src="https://img.shields.io/badge/OpenAI-GPT--4-green.svg" alt="OpenAI GPT-4">
+  <img src="https://img.shields.io/badge/OpenAI-GPT--5--nano-green.svg" alt="OpenAI GPT-5-nano">
   <img src="https://img.shields.io/badge/Flask-2.0+-red.svg" alt="Flask 2.0+">
   <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License">
 </p>
@@ -14,9 +14,11 @@
 ### 🎯 Key Features
 
 - **🔍 Focused Core Page Analysis**: Intelligently targets essential pages (about, contact, terms, FAQ) instead of crawling irrelevant blog content
+- **⚡ Synchronous Single-Page Scrape**: New `/api/scrape-page` endpoint returns results immediately without a job queue
 - **📸 Visual Context Integration**: Captures full-page screenshots for enhanced AI understanding
 - **🌐 Multi-Language Support**: Automatic language detection with Persian/Farsi optimization
-- **🤖 AI-Powered Knowledge Extraction**: Uses advanced OpenAI models for intelligent content processing
+- **🤖 GPT-5-nano Powered**: Uses OpenAI's latest model — 8x cheaper on input, 400K context window, 128K output
+- **🧹 Smart HTML Preprocessing**: Strips noise tags (scripts, nav, footer) before AI processing to save tokens
 - **📊 Comprehensive Reporting**: Automatic report generation with detailed metadata
 - **⚡ Asynchronous Processing**: Background job handling with real-time progress tracking
 - **🔐 Secure API**: API key authentication for all endpoints
@@ -40,7 +42,7 @@
 ## 🛠️ Technology Stack
 
 - **Backend**: Python 3.7+, Flask
-- **AI Processing**: OpenAI GPT-4 API
+- **AI Processing**: OpenAI GPT-5-nano API
 - **Web Crawling**: Requests, Selenium WebDriver
 - **Content Processing**: BeautifulSoup4, Pillow (PIL)
 - **Data Storage**: JSON reports, Markdown knowledge bases
@@ -92,8 +94,8 @@ SERVICE_API_KEY=your_strong_secret_api_key_here
 # Your OpenAI API key
 OPENAI_API_KEY=sk-your_openai_api_key_here
 
-# Optional: Custom OpenAI model (default: gpt-4.1-nano-2025-04-14)
-# OPENAI_MODEL=gpt-4-turbo
+# Optional: Override the OpenAI model (default: gpt-5-nano)
+# OPENAI_MODEL=gpt-5-nano
 ```
 
 ### 3. Run the Service
@@ -134,7 +136,45 @@ curl -H "api-key: your_service_api_key" \
 
 ### Core Endpoints
 
-#### 1. Generate Knowledge Base
+#### 1. Scrape Single Page (Synchronous)
+
+**POST** `/api/scrape-page`
+
+Scrape and extract structured knowledge from a single URL immediately. Returns the result directly — no polling required.
+
+```json
+{
+  "url": "https://example.com/about/",
+  "use_selenium": false,
+  "include_screenshot": false
+}
+```
+
+**Parameters:**
+- `url` (required): The page URL to scrape
+- `use_selenium` (optional): Use Selenium for JavaScript-rendered pages (default: `false`)
+- `include_screenshot` (optional): Capture a full-page screenshot for visual context (default: `false`)
+
+**Response (200):**
+```json
+{
+  "status": "success",
+  "url": "https://example.com/about/",
+  "title": "About Us",
+  "detected_language": "en",
+  "extracted_content": "# About Us\n\n...",
+  "screenshot_captured": false,
+  "cost_estimation": {
+    "total_cost_usd": "0.000826",
+    "prompt_tokens": 4200,
+    "completion_tokens": 800
+  }
+}
+```
+
+---
+
+#### 2. Generate Knowledge Base
 
 **POST** `/api/generate-knowledge-base`
 
@@ -161,7 +201,7 @@ Generate a comprehensive knowledge base from a website.
 - `use_selenium` (optional): Enable screenshot capture and JavaScript rendering
 - `max_pages` (optional): Maximum number of pages to process
 
-#### 2. Check Job Status
+#### 3. Check Job Status
 
 **GET** `/api/jobs/{job_id}`
 
@@ -185,7 +225,7 @@ Monitor job progress and retrieve results.
 }
 ```
 
-#### 3. Health Check
+#### 4. Health Check
 
 **GET** `/api/health`
 
@@ -251,7 +291,8 @@ reports/
 
 - Monitor OpenAI API usage costs
 - Each job provides cost estimation
-- Typical cost: $0.02-$0.05 per website
+- Typical cost: **$0.002-$0.008 per website** (gpt-5-nano is ~8x cheaper on input than previous models)
+- Single-page scrape via `/api/scrape-page` typically costs under $0.001
 
 ### Performance
 
@@ -334,7 +375,7 @@ MAX_PAGES_FOR_KB_GENERATION = 10
 
 - **Processing Speed**: 1-2 pages per minute
 - **Accuracy**: 95%+ for core page identification
-- **Cost Efficiency**: $0.02-$0.05 per comprehensive analysis
+- **Cost Efficiency**: $0.002-$0.008 per comprehensive analysis (gpt-5-nano)
 - **Success Rate**: 98%+ for accessible websites
 - **PDF Generation**: 2-3 seconds per report
 - **Batch Testing**: 9 websites in ~30-45 minutes
