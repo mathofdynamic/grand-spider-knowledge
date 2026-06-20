@@ -9,24 +9,24 @@
 
 ## 🚀 Overview
 
-**Grand Spider** is a sophisticated AI-powered web analysis platform designed to generate comprehensive knowledge bases from websites. It's specifically optimized for creating chatbot training data by focusing on core website information rather than irrelevant content.
+**Grand Spider** is a sophisticated AI-powered web analysis platform that turns any website into a single, coherent knowledge-base document for chatbot/RAG use. The overhauled `generate-knowledge-base` pipeline discovers a site deeply (sitemap + crawl), deterministically filters out product/cart/asset noise, uses AI to select the most knowledge-rich pages, extracts clean content in parallel, and synthesises the result **section by section** — so it stays complete on large (1000+ page) e-commerce sites without blowing past token limits.
 
 ### 🎯 Key Features
 
-- **🔍 Focused Core Page Analysis**: Intelligently targets essential pages (about, contact, terms, FAQ) instead of crawling irrelevant blog content
-- **⚡ Synchronous Single-Page Scrape**: New `/api/scrape-page` endpoint returns results immediately without a job queue
-- **📸 Visual Context Integration**: Captures full-page screenshots for enhanced AI understanding
-- **🌐 Multi-Language Support**: Automatic language detection with Persian/Farsi optimization
-- **🤖 GPT-5-nano Powered**: Uses OpenAI's latest model — 8x cheaper on input, 400K context window, 128K output
-- **🧹 Smart HTML Preprocessing**: Strips noise tags (scripts, nav, footer) before AI processing to save tokens
-- **📊 Comprehensive Reporting**: Automatic report generation with detailed metadata
-- **⚡ Asynchronous Processing**: Background job handling with real-time progress tracking
-- **🔐 Secure API**: API key authentication for all endpoints
-- **📄 Beautiful PDF Generation**: Creates stunning Persian-formatted PDF reports with RTL text support
-- **🎨 Website Color Analysis**: Extracts and analyzes website brand colors and design elements
-- **📈 Cost Tracking**: Real-time cost estimation and token usage monitoring
-- **🧪 Comprehensive Testing Suite**: Automated testing framework for multiple websites
-- **📁 Organized Output**: Structured file organization with dedicated reports folder
+- **🔍 Deep, scalable discovery + smart selection**: Sitemap → crawl → **deterministic pre-filter** (drops product/cart/checkout/admin/asset/faceted URLs for free) → AI selection of the most knowledge-rich pages, bounded by a page budget. Handles 1000+ page sites without sending the catalogue to an LLM. (Set `depth: "core"` for the legacy hardcoded-core-page behaviour.)
+- **🧹 Clean-text extraction**: Converts HTML → clean markdown with **trafilatura** (readability/BeautifulSoup fallbacks) before the model — ~5–10× fewer input tokens and much higher signal than raw HTML.
+- **🧩 Per-section map-reduce synthesis**: Each page is classified into a canonical section; sections are synthesised **independently** (with map-reduce for large ones), removing the old single ≤16K-token compile bottleneck so the document stays complete.
+- **🎚️ Tiered models**: Cheap model for bulk extraction/classification, an optional stronger model for synthesis via `OPENAI_MODEL_STRONG` (defaults to the cheap model — no cost change until you opt in). Per-model cost breakdown in `cost_estimation.by_model`.
+- **⚡ Parallel extraction**: Pages are fetched + extracted concurrently (thread pool) for speed and resilience — one slow/failed page no longer kills the whole job.
+- **✅ Completeness audit + contact safety-net**: A `quality_report` flags missing contact/policy/FAQ; a regex pass harvests emails/phone numbers so contact details aren't missed.
+- **⚡ Synchronous Single-Page Scrape**: `/api/scrape-page` returns results immediately without a job queue.
+- **📸 Visual Context Integration**: Captures full-page screenshots for enhanced AI understanding.
+- **🌐 Multi-Language Support**: Automatic language detection with Persian/Farsi optimization.
+- **📊 Comprehensive Reporting**: Markdown KB + JSON metadata (discovery/selection/section stats, quality report, per-model cost).
+- **🔐 Secure API**: API key authentication for all endpoints.
+- **🎨 Website Color Analysis**: Extracts website brand colors and design elements.
+- **📈 Cost Tracking**: Real-time cost estimation and token usage monitoring.
+- **🧪 Comprehensive Testing Suite**: Automated testing framework for multiple websites.
 
 ### 🎯 Use Cases
 
@@ -42,9 +42,9 @@
 ## 🛠️ Technology Stack
 
 - **Backend**: Python 3.7+, Flask
-- **AI Processing**: OpenAI GPT-5-nano API
+- **AI Processing**: OpenAI GPT-5 family (tiered: cheap model for extraction, optional strong model for synthesis)
 - **Web Crawling**: Requests, Selenium WebDriver
-- **Content Processing**: BeautifulSoup4, Pillow (PIL)
+- **Content Processing**: trafilatura + readability-lxml (clean main-content extraction), BeautifulSoup4, Pillow (PIL)
 - **Data Storage**: JSON reports, Markdown knowledge bases
 - **Authentication**: API key-based security
 - **PDF Generation**: ReportLab with Persian font support
@@ -96,6 +96,13 @@ OPENAI_API_KEY=sk-your_openai_api_key_here
 
 # Optional: Override the OpenAI model (default: gpt-5-nano)
 # OPENAI_MODEL=gpt-5-nano
+
+# --- Tiered models (optional) ---
+# The knowledge-base pipeline can use a cheap model for bulk extraction/classification and
+# a stronger model for the final per-section synthesis. Defaults keep BOTH on the cheap
+# model, so cost is unchanged until you opt in by setting OPENAI_MODEL_STRONG.
+# OPENAI_MODEL_CHEAP=gpt-5-nano
+# OPENAI_MODEL_STRONG=gpt-5-mini
 ```
 
 ### 3. Run the Service
@@ -183,23 +190,22 @@ Generate a comprehensive knowledge base from a website.
     ```json
     {
   "url": "https://example.com",
-  "specific_pages": [
-    "https://example.com/",
-    "https://example.com/about/",
-    "https://example.com/contact/",
-    "https://example.com/terms/",
-    "https://example.com/faq/"
-  ],
-  "use_selenium": true,
-  "max_pages": 10
+  "depth": "deep",
+  "max_pages": 25,
+  "target_doc_tokens": 18000,
+  "use_selenium": true
 }
 ```
 
 **Parameters:**
 - `url` (required): Base URL of the website
-- `specific_pages` (optional): Array of specific page URLs to process
-- `use_selenium` (optional): Enable screenshot capture and JavaScript rendering
-- `max_pages` (optional): Maximum number of pages to process
+- `depth` (optional, default `deep`): `deep` discovers the whole site (sitemap + crawl), deterministically drops product/cart/asset URLs, and uses AI to select the most knowledge-rich pages — scales to 1000+ page sites. `core` uses only the legacy hardcoded core-page patterns (about/contact/faq/...).
+- `max_pages` (optional, default 25): Page budget — how many knowledge pages to deeply extract (capped at 80).
+- `target_doc_tokens` (optional, default 18000): Soft size budget for the final single document; lowest-priority sections are compressed first if exceeded.
+- `specific_pages` (optional): Array of exact page URLs to process (overrides discovery).
+- `use_selenium` (optional): Enable screenshot capture and a JS-rendering crawl fallback.
+
+**How the deep pipeline works:** discover URLs → deterministic pre-filter → AI page selection (within `max_pages`) → parallel clean-text extraction on the cheap model (each page classified into a canonical section) → per-section map-reduce synthesis on the strong model (no global token cap) → assembly into one document → completeness audit. The response keeps the same shape as before, plus a `quality_report` and a richer `comprehensive_analysis` (discovery/selection/section metadata) and per-model cost breakdown in `cost_estimation.by_model`.
 
 #### 3. Check Job Status
 

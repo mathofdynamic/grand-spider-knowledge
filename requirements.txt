@@ -4,6 +4,11 @@ python-dotenv>=1.0.0
 requests>=2.31.0
 beautifulsoup4>=4.12.0
 tiktoken>=0.5.0
+# Clean main-content extraction (HTML -> markdown/text). trafilatura is primary,
+# readability-lxml is the fallback. Both are optional but strongly recommended.
+trafilatura>=1.8.0
+readability-lxml>=0.8.1
+lxml>=4.9.0
 # For Selenium (optional, uncomment if needed)
 selenium>=4.15.0
 webdriver-manager>=4.0.0
