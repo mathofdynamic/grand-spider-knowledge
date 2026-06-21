@@ -21,7 +21,7 @@
 - **✅ Completeness audit + contact safety-net**: A `quality_report` flags missing contact/policy/FAQ; a regex pass harvests emails/phone numbers so contact details aren't missed.
 - **⚡ Synchronous Single-Page Scrape**: `/api/scrape-page` returns results immediately without a job queue.
 - **📸 Visual Context Integration**: Captures full-page screenshots for enhanced AI understanding.
-- **🌐 Multi-Language Support**: Automatic language detection with Persian/Farsi optimization.
+- **🌐 Source-language output**: The knowledge base is written in the **website's own language**, so a Farsi site yields a Farsi KB (headings, table of contents and body) that matches the chatbot's language. Detection is deterministic script-based for Persian/Arabic (immune to slow/head-heavy pages) with an LLM fallback, run on clean visible text rather than raw HTML.
 - **📊 Comprehensive Reporting**: Markdown KB + JSON metadata (discovery/selection/section stats, quality report, per-model cost).
 - **🔐 Secure API**: API key authentication for all endpoints.
 - **🎨 Website Color Analysis**: Extracts website brand colors and design elements.

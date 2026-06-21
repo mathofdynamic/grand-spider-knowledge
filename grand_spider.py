@@ -154,6 +154,26 @@ KB_SECTION_PRIORITY = [
     "contact", "policies", "company_overview", "ordering_payment",
     "faq", "support_howto", "products_services", "additional",
 ]
+# Localized section titles so the final document's headings/TOC match the site language.
+KB_SECTION_TITLES_LOCALIZED = {
+    "fa": {
+        "company_overview": "معرفی شرکت",
+        "contact": "اطلاعات تماس",
+        "products_services": "محصولات و خدمات",
+        "policies": "قوانین و سیاست‌ها (ارسال / بازگشت / گارانتی / حریم خصوصی / شرایط)",
+        "faq": "پرسش‌های متداول",
+        "ordering_payment": "نحوه سفارش و روش‌های پرداخت",
+        "support_howto": "پشتیبانی، راهنما و عیب‌یابی",
+        "additional": "اطلاعات تکمیلی",
+    },
+}
+
+def section_title(key: str, lang: str) -> str:
+    """Canonical section heading localized to the target language (falls back to English)."""
+    loc = KB_SECTION_TITLES_LOCALIZED.get((lang or "").lower())
+    if loc and key in loc:
+        return loc[key]
+    return KB_SECTION_TITLES.get(key, key)
 
 # --- Crawling & Discovery Constants ---
 CRAWLER_USER_AGENT = 'GrandSpiderMultiPurposeAnalyzer/2.0 (+http://yourappdomain.com/bot)'
@@ -187,6 +207,7 @@ PROGRESS_MESSAGES_FA = {
     "Extracting knowledge from core pages...": "استخراج دانش از صفحات اصلی...",
     "Compiling comprehensive knowledge base...": "تدوین پایگاه دانش جامع...",
     # Overhauled deep pipeline
+    "Fetching homepage...": "دریافت صفحه اصلی...",
     "Extracting knowledge from pages...": "استخراج دانش از صفحات...",
     "Extracting knowledge": "استخراج دانش از صفحات...",
     "Writing section": "در حال نوشتن بخش پایگاه دانش...",
@@ -1016,33 +1037,119 @@ def qualify_prospect_with_openai(page_content: str, prospect_url: str, user_prof
     return result_json, completion.usage
 
 # For Knowledge Base Generation
-def detect_language_from_html_with_openai(html_snippet: str, url: str) -> tuple[str, int, int]:
-    if not openai_client: raise ConnectionError("OpenAI client not initialized.")
-    if not html_snippet or not html_snippet.strip(): return DEFAULT_TARGET_LANGUAGE, 0, 0
+# --- Language detection (source-language aware) ---
+LANGUAGE_NAMES = {
+    "fa": "Persian (Farsi)", "ar": "Arabic", "en": "English", "fr": "French",
+    "de": "German", "es": "Spanish", "it": "Italian", "tr": "Turkish",
+    "ru": "Russian", "zh": "Chinese", "ja": "Japanese", "ko": "Korean",
+    "hi": "Hindi", "ur": "Urdu", "pt": "Portuguese", "nl": "Dutch",
+}
+
+def language_name(code: str) -> str:
+    """Human-readable language name for prompts (models follow names better than codes)."""
+    return LANGUAGE_NAMES.get((code or "").lower(), (code or "the source language"))
+
+_ARABIC_SCRIPT_RE = re.compile(
+    '[؀-ۿݐ-ݿࢠ-ࣿﭐ-﷿ﹰ-﻿]')
+_LATIN_LETTER_RE = re.compile(r'[A-Za-z]')
+# Persian-specific letters (پ چ ژ ک گ ی) distinguish Farsi from Arabic.
+_PERSIAN_SPECIFIC_RE = re.compile('[پچژکگی]')
+
+
+def detect_language_deterministic(text: str, threshold: float = 0.15):
+    """Script-based detection for Arabic-script languages (Persian/Arabic).
+
+    Returns 'fa', 'ar', or None when not confidently Arabic-script. This is reliable for
+    Farsi sites and immune to slow homepages / head-heavy HTML, so it runs before the LLM.
+    """
+    if not text:
+        return None
+    sample = text[:5000]
+    arabic = len(_ARABIC_SCRIPT_RE.findall(sample))
+    latin = len(_LATIN_LETTER_RE.findall(sample))
+    if arabic + latin == 0:
+        return None
+    if arabic >= 20 and arabic / (arabic + latin) >= threshold:
+        return "fa" if _PERSIAN_SPECIFIC_RE.search(sample) else "ar"
+    return None
+
+
+def _llm_detect_language(text: str, url: str) -> tuple[str, int, int]:
+    """LLM language identification from clean visible text. Returns (code, p, c)."""
+    if not openai_client:
+        raise ConnectionError("OpenAI client not initialized.")
+    if not text or not text.strip():
+        return DEFAULT_TARGET_LANGUAGE, 0, 0
     messages = [
-        {
-            "role": "developer",
-            "content": (
-                "You are a language identification tool. "
-                "Your ONLY output is a single 2-letter ISO 639-1 language code. "
-                "No explanations, no punctuation, no extra text. "
-                "Examples of valid outputs: en  fa  ar  fr  de  es  zh  tr"
-            )
-        },
-        {
-            "role": "user",
-            "content": f"Identify the primary language of the visible text content in this HTML:\n\n{html_snippet}"
-        }
+        {"role": "developer", "content": (
+            "You are a language identification tool. Your ONLY output is a single 2-letter "
+            "ISO 639-1 language code. No explanations. Examples: en  fa  ar  fr  de  es  zh  tr"
+        )},
+        {"role": "user", "content": f"Identify the primary language of this text:\n\n{text}"},
     ]
-    p_tokens = count_tokens(html_snippet)
-    completion = openai_client.chat.completions.create(model=OPENAI_MODEL, messages=messages, max_completion_tokens=MAX_RESPONSE_TOKENS_LANG_DETECT)
-    lang = completion.choices[0].message.content.strip().lower()
+    p_tokens = count_tokens(text)
+    completion = openai_client.chat.completions.create(
+        model=OPENAI_MODEL_CHEAP, messages=messages, max_completion_tokens=MAX_RESPONSE_TOKENS_LANG_DETECT)
+    lang = (completion.choices[0].message.content or "").strip().lower()
     c_tokens = completion.usage.completion_tokens if completion.usage else 0
-    # Validate it's a proper language code
     if len(lang) == 2 and lang.isalpha():
         return lang, p_tokens, c_tokens
-    else:
-        return DEFAULT_TARGET_LANGUAGE, p_tokens, c_tokens
+    return DEFAULT_TARGET_LANGUAGE, p_tokens, c_tokens
+
+
+def detect_language_from_html_with_openai(html_snippet: str, url: str) -> tuple[str, int, int]:
+    """Detect language from a page's CLEAN visible text (deterministic first, LLM fallback).
+
+    Signature-compatible with the previous version (used by /api/scrape-page). The key fix:
+    detect from extracted visible text, not raw HTML head/markup which skews toward English.
+    """
+    if not openai_client: raise ConnectionError("OpenAI client not initialized.")
+    if not html_snippet or not html_snippet.strip():
+        return DEFAULT_TARGET_LANGUAGE, 0, 0
+    clean = clean_text_from_html(html_snippet, url) or html_snippet
+    det = detect_language_deterministic(clean)
+    if det:
+        return det, 0, 0
+    return _llm_detect_language(clean[:6000], url)
+
+
+def detect_site_language(main_page_html: str, base_url: str, candidate_pages: list,
+                         cost: "CostAccumulator") -> str:
+    """Robustly determine the site's primary language from SOURCE content.
+
+    Deterministic script detection first (reliable for Persian/Arabic and immune to slow or
+    head-heavy homepages), then LLM on clean visible text, falling back across a few candidate
+    pages before defaulting. Prevents silently defaulting Farsi sites to English.
+    """
+    if main_page_html:
+        clean = clean_text_from_html(main_page_html, base_url)
+        det = detect_language_deterministic(clean)
+        if det:
+            return det
+        if clean and clean.strip():
+            lang, p, c = _llm_detect_language(clean[:6000], base_url)
+            cost.add(OPENAI_MODEL_CHEAP, p, c)
+            if lang and lang != DEFAULT_TARGET_LANGUAGE:
+                return lang
+
+    for pg in (candidate_pages or [])[:4]:
+        try:
+            html = fetch_url_html_content(pg.get("url"))
+        except Exception:
+            html = None
+        if not html:
+            continue
+        clean = clean_text_from_html(html, pg.get("url"))
+        det = detect_language_deterministic(clean)
+        if det:
+            return det
+        if clean and clean.strip():
+            lang, p, c = _llm_detect_language(clean[:6000], pg.get("url"))
+            cost.add(OPENAI_MODEL_CHEAP, p, c)
+            if lang and lang != DEFAULT_TARGET_LANGUAGE:
+                return lang
+
+    return DEFAULT_TARGET_LANGUAGE
 
 def analyze_all_urls_comprehensively(page_details: list[dict], root_url: str, lang: str) -> tuple[dict, int, int]:
     """Analyze ALL discovered URLs and categorize them comprehensively."""
@@ -1475,6 +1582,7 @@ def extract_knowledge_from_page_with_openai(html_content: str, url: str, title: 
 
     clean_text = clean_text_from_html(html_content, url)
     section_keys_str = ", ".join(KB_SECTION_KEYS)
+    lang_name = language_name(lang)
 
     user_text = f"""Extract ALL customer-relevant knowledge from this web page for a customer-support chatbot.
 
@@ -1490,7 +1598,7 @@ Rules:
 - Preserve phone numbers, emails, addresses, prices and policy clauses VERBATIM.
 - Represent FAQs as **Q:** / **A:** pairs, but ONLY include questions that have an actual answer in the content; skip any question with no answer.
 - Ignore navigation menus, cookie banners and unrelated product-catalog listings.
-- Write the extracted_chunk entirely in {lang} (translate if the source language differs).
+- Write the extracted_chunk entirely in {lang_name}. If the source text is in another language, translate it INTO {lang_name}. Do NOT output English unless {lang_name} is English.
 - If the page has no useful customer knowledge, return an empty string for extracted_chunk.
 
 Classify the page's PRIMARY purpose into exactly one of: {section_keys_str}
@@ -1498,9 +1606,9 @@ Classify the page's PRIMARY purpose into exactly one of: {section_keys_str}
 Output ONLY this JSON:
 {{
   "url": "{url}",
-  "title_suggestion": "<short descriptive title in {lang}>",
+  "title_suggestion": "<short descriptive title in {lang_name}>",
   "primary_category": "<one of: {section_keys_str}>",
-  "extracted_chunk": "<comprehensive Markdown in {lang} covering everything useful on this page>"
+  "extracted_chunk": "<comprehensive Markdown in {lang_name} covering everything useful on this page>"
 }}
 
 PAGE CONTENT:
@@ -1518,7 +1626,9 @@ PAGE CONTENT:
             "role": "developer",
             "content": (
                 f"You are a precise knowledge-extraction engine for chatbot training data. "
-                f"Output language: {lang}. Keep contact details, prices and policy text verbatim. "
+                f"Write ALL output in {lang_name} (translate source content into {lang_name}; "
+                f"never use English unless {lang_name} is English). "
+                f"Keep contact details, prices and policy text verbatim. "
                 f"Output ONLY valid JSON matching the schema provided."
             )
         },
@@ -2058,13 +2168,14 @@ def synthesize_section(section_key: str, section_title: str, chunks: list, base_
         messages = [
             {"role": "developer", "content": (
                 f"You are a senior technical writer assembling the '{section_title}' section of a "
-                f"customer-support knowledge base, written entirely in {lang}. Merge the source "
-                f"extracts into one clean, well-structured Markdown section. Remove duplicate facts. "
-                f"Resolve conflicts by keeping the most complete version. Preserve phone numbers, "
-                f"emails, addresses, prices and policy clauses VERBATIM. Do NOT invent information. "
-                f"Do NOT restate the section title and do NOT mention source URLs. Start directly with "
-                f"the content; use heading level #### and below for any sub-headings. "
-                f"Output Markdown only (no JSON, no code fences)."
+                f"customer-support knowledge base. Write the ENTIRE section in {language_name(lang)} "
+                f"(translate any source content into {language_name(lang)}; never use English unless "
+                f"that is the target language). Merge the source extracts into one clean, well-structured "
+                f"Markdown section. Remove duplicate facts. Resolve conflicts by keeping the most complete "
+                f"version. Preserve phone numbers, emails, addresses, prices and policy clauses VERBATIM. "
+                f"Do NOT invent information. Do NOT restate the section title and do NOT mention source "
+                f"URLs. Start directly with the content; use heading level #### and below for any "
+                f"sub-headings. Output Markdown only (no JSON, no code fences)."
             )},
             {"role": "user", "content": (
                 f"{note}\n\n{ctx}Source extracts:\n\n{body}"
@@ -2098,7 +2209,7 @@ def assemble_final_kb(section_outputs: dict, base_url: str, lang: str, cost: Cos
     and enforces a soft size budget by compressing lowest-priority sections first.
     Returns (markdown_document, assembly_meta).
     """
-    present = [(k, KB_SECTION_TITLES[k]) for k in KB_SECTION_KEYS if section_outputs.get(k, "").strip()]
+    present = [(k, section_title(k, lang)) for k in KB_SECTION_KEYS if section_outputs.get(k, "").strip()]
     assembly_meta = {"sections_present": [k for k, _ in present], "compressed_sections": [], "trimmed": False}
 
     overview_src = "\n\n".join(section_outputs.get(k, "") for k in ("company_overview", "products_services")
@@ -2109,9 +2220,10 @@ def assemble_final_kb(section_outputs: dict, base_url: str, lang: str, cost: Cos
     try:
         messages = [
             {"role": "developer", "content": (
-                f"You are writing the short opening of a customer-support knowledge base in {lang}. "
-                f"Write 2-4 sentences introducing the company and what this document covers. "
-                f"Markdown only, no headings, no lists."
+                f"You are writing the short opening of a customer-support knowledge base. "
+                f"Write the opening ENTIRELY in {language_name(lang)} (never use English unless that is "
+                f"the target language). Write 2-4 sentences introducing the company and what this "
+                f"document covers. Markdown only, no headings, no lists."
             )},
             {"role": "user", "content": f"Website: {base_url}\n\nOverview material:\n{overview_src[:6000]}\n\nSections covered:\n{toc_lines}"},
         ]
@@ -2136,9 +2248,10 @@ def assemble_final_kb(section_outputs: dict, base_url: str, lang: str, cost: Cos
             try:
                 messages = [
                     {"role": "developer", "content": (
-                        f"Condense the following knowledge-base section in {lang} to its essential, "
-                        f"customer-relevant facts. Keep contact details, prices and policy specifics "
-                        f"verbatim. Markdown only, using heading level ### and below."
+                        f"Condense the following knowledge-base section to its essential, "
+                        f"customer-relevant facts. Write ENTIRELY in {language_name(lang)} (never use "
+                        f"English unless that is the target language). Keep contact details, prices and "
+                        f"policy specifics verbatim. Markdown only, using heading level #### and below."
                     )},
                     {"role": "user", "content": text},
                 ]
@@ -2176,7 +2289,7 @@ def check_kb_completeness(document: str, lang: str, contact_candidates: dict,
             {"role": "developer", "content": (
                 "You audit a customer-support knowledge base for completeness. Output ONLY JSON: "
                 "{\"has_contact\":bool, \"has_policies\":bool, \"has_faq\":bool, "
-                "\"has_services\":bool, \"missing\":[\"...\"], \"notes\":\"<short, in " + lang + ">\"}."
+                "\"has_services\":bool, \"missing\":[\"...\"], \"notes\":\"<short, in " + language_name(lang) + ">\"}."
             )},
             {"role": "user", "content": f"Knowledge base document:\n\n{document[:12000]}"},
         ]
@@ -2202,12 +2315,14 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
     page_budget = max(1, min(int(max_pages_for_kb or DEFAULT_KB_PAGE_BUDGET), MAX_KB_PAGE_BUDGET))
 
     try:
-        # 1. Language detection
-        update_job_progress(job_id, "Detecting language...")
-        main_page_html = fetch_url_html_content(base_url, for_lang_detect=True)
-        lang, p, c = detect_language_from_html_with_openai(main_page_html, base_url)
-        cost.add(OPENAI_MODEL_CHEAP, p, c)
-        with jobs_lock: jobs[job_id]["detected_target_language"] = lang
+        # 1. Fetch homepage (full) for colour + language detection.
+        update_job_progress(job_id, "Fetching homepage...")
+        try:
+            main_page_html = fetch_url_html_content(base_url)
+        except Exception as e:
+            logger.warning(f"Homepage fetch failed for colour/language detection: {e}")
+            main_page_html = None
+        lang = DEFAULT_TARGET_LANGUAGE
 
         # 2. Main page screenshot (visual context for the main-page extraction)
         update_job_progress(job_id, "Capturing main page screenshot...")
@@ -2250,6 +2365,12 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
         with jobs_lock: jobs[job_id]["initial_found_pages_count"] = len(selected)
         logger.info(f"Selected {len(selected)} knowledge pages for extraction")
 
+        # 3.5 Detect the site's primary language from SOURCE content (deterministic-first).
+        update_job_progress(job_id, "Detecting language...")
+        lang = detect_site_language(main_page_html, base_url, selected, cost)
+        with jobs_lock: jobs[job_id]["detected_target_language"] = lang
+        logger.info(f"Detected target language: {lang} ({language_name(lang)})")
+
         # 4. Parallel per-page extraction (clean text -> cheap model)
         update_job_progress(job_id, "Extracting knowledge from pages...")
         chunks = extract_pages_parallel(
@@ -2279,8 +2400,8 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
                          f"Phones: {', '.join(contact_candidates['phones']) or 'none'}")
             if not chs and not extra:
                 continue
-            update_job_progress(job_id, f"Writing section: {KB_SECTION_TITLES[key]}...")
-            out = synthesize_section(key, KB_SECTION_TITLES[key], chs, base_url, lang, cost, extra)
+            update_job_progress(job_id, f"Writing section: {section_title(key, lang)}...")
+            out = synthesize_section(key, section_title(key, lang), chs, base_url, lang, cost, extra)
             if out.strip():
                 section_outputs[key] = out
 
