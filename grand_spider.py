@@ -1,7 +1,11 @@
 import os
+import hashlib
+import hmac
+import ipaddress
 import logging
 import requests
 import functools
+import socket
 import threading
 import time
 import uuid
@@ -10,13 +14,20 @@ import csv
 import re
 import collections
 import concurrent.futures
+import urllib.robotparser
 import xml.etree.ElementTree as ET
 from flask import Flask, request, jsonify
 from openai import OpenAI, APIError, RateLimitError, APITimeoutError, APIConnectionError
 from dotenv import load_dotenv
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, unquote
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import tiktoken
+
+from structured_data import (extract_structured_data, merge_structured_facts,
+                             structured_facts_summary_text)
+from brand_kit import build_brand_kit
 
 # --- Selenium Imports ---
 try:
@@ -63,6 +74,8 @@ except ImportError:
 # --- Configuration & Initialization ---
 load_dotenv()
 app = Flask(__name__)
+# Bound request bodies (JSON payloads / HTML file uploads) to prevent memory-exhaustion DoS.
+app.config['MAX_CONTENT_LENGTH'] = 8 * 1024 * 1024
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(threadName)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -118,8 +131,6 @@ MAX_RESPONSE_TOKENS_PROSPECT = 800
 DEFAULT_TARGET_LANGUAGE = "en"
 MAX_RESPONSE_TOKENS_LANG_DETECT = 50
 MAX_RESPONSE_TOKENS_PAGE_SELECTION = 2000
-MAX_RESPONSE_TOKENS_KB_EXTRACTION = 16000
-MAX_RESPONSE_TOKENS_KB_COMPILATION = 16000
 
 # --- New pipeline tunables (overhauled KB generation) ---
 MAX_CLEAN_TEXT_CHARS = 40000                 # cap clean main-content text per page before LLM
@@ -177,13 +188,93 @@ def section_title(key: str, lang: str) -> str:
 
 # --- Crawling & Discovery Constants ---
 CRAWLER_USER_AGENT = 'GrandSpiderMultiPurposeAnalyzer/2.0 (+http://yourappdomain.com/bot)'
-MAX_PAGES_FOR_KB_GENERATION = 20
-MAX_URLS_FROM_SITEMAP_TO_PROCESS_TITLES = 200
-MIN_DISCOVERED_PAGES_BEFORE_FALLBACK_CRAWL = 20
 MAX_PAGES_FOR_FALLBACK_DISCOVERY_CRAWL = 30
+MAX_COMPANY_ANALYSIS_PAGES = 50        # upper clamp for /api/analyze-company crawls
+MAX_PROSPECT_URLS_PER_JOB = 100        # upper clamp for /api/qualify-prospects
+CRAWL_DELAY_SECONDS = 0.4              # politeness delay between crawl requests
+SELENIUM_FALLBACK_MIN_TEXT = 400       # clean-text length below which a page looks JS-rendered
+SELENIUM_FALLBACK_MIN_HTML = 20000     # ...but only when the raw HTML is substantial
+SELENIUM_FALLBACK_MAX_PAGES = 5        # per-job cap on automatic Selenium re-fetches
+
+# Shared HTTP session: connection pooling + retry-with-backoff on transient failures.
+SESSION = requests.Session()
+_http_adapter = HTTPAdapter(
+    max_retries=Retry(total=2, backoff_factor=0.5, status_forcelist=(500, 502, 503, 504),
+                      allowed_methods=frozenset(['GET', 'HEAD'])),
+    pool_connections=20, pool_maxsize=20,
+)
+SESSION.mount('http://', _http_adapter)
+SESSION.mount('https://', _http_adapter)
+SESSION.headers.update({'User-Agent': CRAWLER_USER_AGENT})
+
+
+def get_robots_parser(base_url: str):
+    """Fetch and parse robots.txt for polite crawling. Returns None when unavailable
+    (treat as allow-all)."""
+    try:
+        resp = SESSION.get(urljoin(base_url, "/robots.txt"), timeout=10)
+        if resp.status_code == 200 and resp.text.strip():
+            rp = urllib.robotparser.RobotFileParser()
+            rp.parse(resp.text.splitlines())
+            return rp
+    except requests.exceptions.RequestException:
+        pass
+    return None
+
+
+def robots_allows(rp, url: str) -> bool:
+    if rp is None:
+        return True
+    try:
+        return rp.can_fetch(CRAWLER_USER_AGENT, url)
+    except Exception:
+        return True
 
 # --- Directories ---
 REPORTS_DIR = "reports"
+
+# --- Per-page extraction cache ---
+# Re-running a site does not re-pay OpenAI for pages whose content hasn't changed:
+# the cache key is (url, target language, hash of the page's clean text).
+EXTRACTION_CACHE_DIR = os.path.join("cache", "extractions")
+EXTRACTION_CACHE_TTL_SECONDS = int(os.getenv("EXTRACTION_CACHE_TTL_SECONDS", 7 * 24 * 3600))
+
+
+def _extraction_cache_path(url: str) -> str:
+    return os.path.join(EXTRACTION_CACHE_DIR,
+                        hashlib.sha256(url.encode('utf-8', 'ignore')).hexdigest() + ".json")
+
+
+def load_cached_extraction(url: str, lang: str, content_hash: str):
+    """Return the cached extraction dict for (url, lang, content) or None."""
+    if EXTRACTION_CACHE_TTL_SECONDS <= 0:
+        return None
+    try:
+        path = _extraction_cache_path(url)
+        if not os.path.exists(path):
+            return None
+        with open(path, encoding='utf-8') as f:
+            entry = json.load(f)
+        if entry.get('lang') != lang or entry.get('content_hash') != content_hash:
+            return None
+        if time.time() - entry.get('ts', 0) > EXTRACTION_CACHE_TTL_SECONDS:
+            return None
+        return entry.get('data')
+    except Exception:
+        return None
+
+
+def store_cached_extraction(url: str, lang: str, content_hash: str, data: dict, model: str):
+    if EXTRACTION_CACHE_TTL_SECONDS <= 0:
+        return
+    try:
+        os.makedirs(EXTRACTION_CACHE_DIR, exist_ok=True)
+        with open(_extraction_cache_path(url), 'w', encoding='utf-8') as f:
+            json.dump({'url': url, 'lang': lang, 'content_hash': content_hash,
+                       'model': model, 'ts': time.time(), 'data': data},
+                      f, ensure_ascii=False)
+    except Exception as e:
+        logger.debug(f"Extraction cache write failed for {url}: {e}")
 
 # --- Progress Messages in Farsi ---
 PROGRESS_MESSAGES_FA = {
@@ -205,7 +296,6 @@ PROGRESS_MESSAGES_FA = {
     "Extracting website colors...": "استخراج رنگ‌های وب‌سایت...",
     "Discovering core website pages...": "کشف صفحات اصلی وب‌سایت...",
     "Extracting knowledge from core pages...": "استخراج دانش از صفحات اصلی...",
-    "Compiling comprehensive knowledge base...": "تدوین پایگاه دانش جامع...",
     # Overhauled deep pipeline
     "Fetching homepage...": "دریافت صفحه اصلی...",
     "Extracting knowledge from pages...": "استخراج دانش از صفحات...",
@@ -388,32 +478,6 @@ def parse_json_response(content: str):
             text = text[start:end].strip()
     return json.loads(text)
 
-KB_WRITING_GUIDELINES_TEMPLATE = """
-Guidelines for structuring the knowledge base in {target_language}:
-1.  Introduction & Conclusion: Provide an overview and summary.
-2.  Logical Flow: Organize thematically; synthesize related points.
-3.  Clear Headings: Use Markdown H1 for major topics, H2/H3 for sub-topics (all in {target_language}).
-4.  Clarity (in {target_language}): Use clear, active sentences. Explain jargon.
-5.  Lists & Tables (in {target_language}): Represent steps as lists. Recreate tables.
-6.  Examples & Edge Cases: Include if present (translate if needed).
-7.  Q/A (in {target_language}): Represent FAQs clearly.
-8.  LANGUAGE: Final KB MUST be entirely in {target_language}. Translate if needed.
-9.  COMPLETENESS & ACCURACY: Reflect ALL relevant info. Ensure accuracy. For policy pages (Terms, Privacy, Returns), extract all sections, clauses, and specific conditions in full or summarize with extreme care to preserve legal/procedural meaning.
-10. Format: Single, well-formatted Markdown document in {target_language}.
-"""
-
-STANDARD_CORE_PAGE_PATHS = {
-    "english": ["about", "about-us", "company", "contact", "contact-us", "support", "help",
-                "terms", "terms-and-conditions", "terms-of-service", "legal",
-                "privacy", "privacy-policy",
-                "shipping", "shipping-policy", "delivery",
-                "returns", "return-policy", "refund-policy",
-                "faq", "faqs", "how-to-order", "payment-methods", "services"],
-    "persian": ["درباره-ما", "تماس-با-ما", "پشتیبانی", "راهنما", "شرایط", "قوانین-و-مقررات",
-                "حریم-خصوصی", "سیاست-حفظ-حریم-خصوصی", "ارسال", "نحوه-ارسال",
-                "بازگشت-کالا", "سوالات-متداول", "پرسش-های-متداول", "راهنمای-خرید", "خدمات"]
-}
-
 def discover_core_pages_only(base_url: str, specific_pages: list = None) -> list[dict]:
     """
     Discover only core website pages that are essential for chatbot knowledge.
@@ -428,7 +492,7 @@ def discover_core_pages_only(base_url: str, specific_pages: list = None) -> list
         for page_url in specific_pages:
             try:
                 # Validate the URL is accessible
-                response = requests.head(page_url, headers={'User-Agent': CRAWLER_USER_AGENT}, timeout=10, allow_redirects=True)
+                response = SESSION.head(page_url, timeout=10, allow_redirects=True)
                 if response.status_code < 400:
                     discovered_pages.append({
                         'url': page_url,
@@ -482,7 +546,7 @@ def discover_core_pages_only(base_url: str, specific_pages: list = None) -> list
     for pattern in core_patterns:
         test_url = base_path + pattern
         try:
-            response = requests.head(test_url, headers={'User-Agent': CRAWLER_USER_AGENT}, timeout=5, allow_redirects=True)
+            response = SESSION.head(test_url, timeout=5, allow_redirects=True)
             if response.status_code < 400:
                 discovered_pages.append({
                     'url': test_url,
@@ -500,6 +564,26 @@ def discover_core_pages_only(base_url: str, specific_pages: list = None) -> list
 # --- Job Management (Thread-Safe) ---
 jobs = {}
 jobs_lock = threading.Lock()
+JOB_RETENTION_SECONDS = 24 * 3600  # evict finished jobs older than this
+MAX_RETAINED_FINISHED_JOBS = 200   # hard cap on finished jobs kept in memory
+
+
+def register_job(job_id: str, job_entry: dict):
+    """Insert a new job, evicting old finished jobs so memory stays bounded."""
+    now = time.time()
+    with jobs_lock:
+        def _finished():
+            return [(jid, j) for jid, j in jobs.items()
+                    if j.get("status") in ("completed", "failed")]
+        for jid, j in _finished():
+            if now - (j.get("finished_at") or j.get("created_at") or now) > JOB_RETENTION_SECONDS:
+                del jobs[jid]
+        finished = _finished()
+        if len(finished) > MAX_RETAINED_FINISHED_JOBS:
+            finished.sort(key=lambda kv: kv[1].get("finished_at") or kv[1].get("created_at") or 0)
+            for jid, _ in finished[:len(finished) - MAX_RETAINED_FINISHED_JOBS]:
+                del jobs[jid]
+        jobs[job_id] = job_entry
 
 
 # --- Authentication Decorator ---
@@ -514,12 +598,55 @@ def require_api_key(f):
         if not incoming_api_key:
             logger.warning("Unauthorized access attempt: Missing API key")
             return jsonify({"error": "Unauthorized: Missing 'api-key' header"}), 401
-        if incoming_api_key != EXPECTED_SERVICE_API_KEY:
-            log_key = incoming_api_key[:4] + '...' if incoming_api_key else 'None'
-            logger.warning(f"Unauthorized access attempt: Invalid API key provided (starts with: {log_key}).")
+        if not hmac.compare_digest(incoming_api_key.encode('utf-8'),
+                                   EXPECTED_SERVICE_API_KEY.encode('utf-8')):
+            logger.warning("Unauthorized access attempt: Invalid API key provided.")
             return jsonify({"error": "Unauthorized: Invalid API key"}), 401
         return f(*args, **kwargs)
     return decorated_function
+
+
+def get_json_body():
+    """Parse the request's JSON body. Returns (data, None) or (None, error_response)."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return None, (jsonify({"error": "Request body must be a JSON object."}), 400)
+    return data, None
+
+
+# --- URL Safety (SSRF guard) ---
+def validate_public_http_url(url) -> str | None:
+    """Reject URLs that are not public http(s) targets (SSRF guard).
+
+    Returns an error message when the URL is unsafe/invalid, else None. Every IP the
+    hostname resolves to must be public: loopback, private (RFC1918), link-local
+    (incl. the 169.254.169.254 cloud metadata endpoint), reserved and multicast
+    ranges are refused so callers cannot make this server probe internal services.
+    """
+    if not url or not isinstance(url, str):
+        return "A URL string is required."
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return "Invalid URL."
+    if parsed.scheme not in ("http", "https"):
+        return "URL must use http or https."
+    hostname = parsed.hostname
+    if not hostname:
+        return "URL has no hostname."
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        addr_infos = socket.getaddrinfo(hostname, port, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, UnicodeError, OverflowError):
+        return f"Could not resolve hostname '{hostname}'."
+    for info in addr_infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return "URL resolves to an unparsable address."
+        if not ip.is_global or ip.is_multicast:
+            return "URL resolves to a non-public network address; refusing to fetch it."
+    return None
 
 # --- Helper Functions (Shared & Feature-Specific) ---
 
@@ -653,7 +780,7 @@ def fetch_url_html_content(url: str, for_lang_detect=False) -> str | None:
     headers = {'User-Agent': CRAWLER_USER_AGENT}
     try:
         if for_lang_detect:
-            with requests.get(url, headers=headers, timeout=15, allow_redirects=True, stream=True) as r:
+            with SESSION.get(url, timeout=15, allow_redirects=True, stream=True) as r:
                 r.raise_for_status()
                 if 'text/html' not in r.headers.get('Content-Type', '').lower(): return None
                 r.encoding = r.apparent_encoding or 'utf-8'
@@ -663,7 +790,7 @@ def fetch_url_html_content(url: str, for_lang_detect=False) -> str | None:
                         html_chunk += chunk
                 return html_chunk
         else:
-            response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            response = SESSION.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
             response.raise_for_status()
             response.encoding = response.apparent_encoding or 'utf-8'
             return response.text[:MAX_HTML_CONTENT_LENGTH]
@@ -671,13 +798,6 @@ def fetch_url_html_content(url: str, for_lang_detect=False) -> str | None:
         logger.error(f"Error fetching HTML for {url}: {req_err}")
         if not for_lang_detect: raise ConnectionError(f"Failed to fetch URL content: {req_err}") from req_err
     return None
-
-def preprocess_html_for_extraction(html: str) -> str:
-    """Strip noise tags before sending to AI to save tokens."""
-    soup = BeautifulSoup(html, 'html.parser')
-    for tag in soup(["script", "style", "nav", "footer", "header", "noscript", "meta", "link", "svg"]):
-        tag.decompose()
-    return str(soup)[:MAX_HTML_CONTENT_LENGTH]
 
 def clean_text_from_html(html: str, url: str = None) -> str:
     """Convert raw HTML into clean, boilerplate-free main content (markdown/text).
@@ -734,7 +854,7 @@ def fetch_url_content(url: str) -> str:
     """Fetches and extracts clean text content from a URL."""
     headers = {'User-Agent': CRAWLER_USER_AGENT}
     try:
-        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        response = SESSION.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
         response.raise_for_status()
         if 'text/html' not in response.headers.get('Content-Type', '').lower():
             logger.warning(f"URL {url} is not HTML content.")
@@ -749,26 +869,60 @@ def fetch_url_content(url: str) -> str:
         raise ConnectionError(f"Failed to fetch URL text content: {req_err}")
 
 
-def get_sitemap_urls_from_xml(xml_content: str) -> list[str]:
-    urls = []
+def get_sitemap_entries_from_xml(xml_content: str):
+    """Parse one sitemap document.
+
+    Returns (page_entries, nested_sitemap_urls) where each page entry is
+    {'url', 'lastmod', 'priority'} — lastmod/priority feed page ranking later.
+    """
+    entries, nested = [], []
     try:
         root = ET.fromstring(xml_content)
-        namespaces = {'s': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
-        for url_element in root.findall('.//s:loc', namespaces) or root.findall('.//loc'):
-            if url_element.text: urls.append(url_element.text.strip())
-        for sitemap_element in root.findall('.//s:sitemap/s:loc', namespaces) or root.findall('.//sitemap/loc'):
-            if sitemap_element.text: urls.append(sitemap_element.text.strip())
-    except ET.ParseError as e: logger.error(f"Failed to parse sitemap XML: {e}")
-    return urls
+    except ET.ParseError as e:
+        logger.error(f"Failed to parse sitemap XML: {e}")
+        return entries, nested
 
-def find_sitemap_urls(base_url: str) -> list[str]:
+    def _local(tag):
+        return tag.rsplit('}', 1)[-1].lower() if isinstance(tag, str) else ''
+
+    for el in root.iter():
+        name = _local(el.tag)
+        if name not in ('url', 'sitemap'):
+            continue
+        loc, lastmod, priority = None, None, None
+        for child in el:
+            cname = _local(child.tag)
+            text = (child.text or '').strip()
+            if cname == 'loc':
+                loc = text
+            elif cname == 'lastmod':
+                lastmod = text
+            elif cname == 'priority':
+                try:
+                    priority = float(text)
+                except ValueError:
+                    pass
+        if not loc:
+            continue
+        if name == 'sitemap':
+            nested.append(loc)
+        else:
+            entries.append({'url': loc, 'lastmod': lastmod, 'priority': priority})
+    return entries, nested
+
+def find_sitemap_urls(base_url: str):
+    """Collect page URLs from all reachable sitemaps.
+
+    Returns (urls, meta_by_url) where meta_by_url maps url -> {'lastmod', 'priority'}.
+    """
     logger.info(f"Attempting to find sitemaps for {base_url}")
     sitemap_paths_to_check = collections.deque()
     final_page_urls = set()
+    meta_by_url = {}
     processed_sitemap_urls = set()
     try:
         robots_url = urljoin(base_url, "/robots.txt")
-        response = requests.get(robots_url, headers={'User-Agent': CRAWLER_USER_AGENT}, timeout=10)
+        response = SESSION.get(robots_url, timeout=10)
         if response.status_code == 200:
             for line in response.text.splitlines():
                 if line.strip().lower().startswith("sitemap:"):
@@ -788,20 +942,29 @@ def find_sitemap_urls(base_url: str) -> list[str]:
     while sitemap_paths_to_check:
         sitemap_url = sitemap_paths_to_check.popleft()
         try:
-            response = requests.get(sitemap_url, headers={'User-Agent': CRAWLER_USER_AGENT}, timeout=15)
+            response = SESSION.get(sitemap_url, timeout=15)
             if response.status_code == 200:
                 content_type = response.headers.get('Content-Type', '').lower()
                 if 'xml' in content_type:
-                    extracted_urls = get_sitemap_urls_from_xml(response.text)
-                    for ext_url in extracted_urls:
-                        if ext_url.endswith('.xml') and ext_url not in processed_sitemap_urls:
-                            sitemap_paths_to_check.append(ext_url)
-                            processed_sitemap_urls.add(ext_url)
-                        elif not ext_url.endswith('.xml'):
-                            final_page_urls.add(ext_url)
+                    entries, nested = get_sitemap_entries_from_xml(response.text)
+                    for sm_url in nested:
+                        if sm_url not in processed_sitemap_urls:
+                            sitemap_paths_to_check.append(sm_url)
+                            processed_sitemap_urls.add(sm_url)
+                    for entry in entries:
+                        ext_url = entry['url']
+                        if ext_url.endswith('.xml'):
+                            if ext_url not in processed_sitemap_urls:
+                                sitemap_paths_to_check.append(ext_url)
+                                processed_sitemap_urls.add(ext_url)
+                            continue
+                        final_page_urls.add(ext_url)
+                        if entry.get('lastmod') or entry.get('priority') is not None:
+                            meta_by_url[ext_url] = {'lastmod': entry.get('lastmod'),
+                                                    'priority': entry.get('priority')}
         except requests.exceptions.RequestException: pass
     logger.info(f"Found {len(final_page_urls)} unique page URLs from sitemaps.")
-    return list(final_page_urls)
+    return list(final_page_urls), meta_by_url
 
 
 def simple_crawl_website(base_url, max_pages=10):
@@ -810,14 +973,19 @@ def simple_crawl_website(base_url, max_pages=10):
     visited_urls = set()
     found_pages_details = []
     base_domain = urlparse(base_url).netloc
-    headers = {'User-Agent': CRAWLER_USER_AGENT}
+    robots = get_robots_parser(base_url)
     while urls_to_visit and len(found_pages_details) < max_pages:
         current_url = urls_to_visit.pop()
         if current_url in visited_urls or urlparse(current_url).netloc != base_domain:
             continue
         visited_urls.add(current_url)
+        if not robots_allows(robots, current_url):
+            logger.info(f"[Simple] Skipping robots-disallowed URL: {current_url}")
+            continue
+        if found_pages_details:
+            time.sleep(CRAWL_DELAY_SECONDS)
         try:
-            response = requests.get(current_url, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            response = SESSION.get(current_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
             response.raise_for_status()
             if response.status_code == 200 and 'text/html' in response.headers.get('Content-Type', '').lower():
                  found_pages_details.append({'url': current_url, 'status': 'found'})
@@ -840,6 +1008,7 @@ def selenium_crawl_website(base_url, max_pages=10):
     visited_urls = set()
     found_pages_details = []
     base_domain = urlparse(base_url).netloc
+    robots = get_robots_parser(base_url)
     driver = None
     try:
         chrome_options = ChromeOptions()
@@ -855,6 +1024,9 @@ def selenium_crawl_website(base_url, max_pages=10):
             if current_url in visited_urls or urlparse(current_url).netloc != base_domain:
                 continue
             visited_urls.add(current_url)
+            if not robots_allows(robots, current_url):
+                logger.info(f"[Selenium] Skipping robots-disallowed URL: {current_url}")
+                continue
             try:
                 driver.get(current_url)
                 WebDriverWait(driver, SELENIUM_PAGE_LOAD_TIMEOUT).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
@@ -922,11 +1094,38 @@ def capture_full_page_screenshot(url: str) -> str | None:
             driver.quit()
 
 
-def scrape_single_page(url: str, use_selenium: bool = False, include_screenshot: bool = False) -> dict:
+def fetch_page_html_via_selenium(url: str) -> str | None:
+    """Fetch one page's rendered HTML with headless Chrome (for JS-heavy pages)."""
+    if not SELENIUM_AVAILABLE:
+        return None
+    driver = None
+    try:
+        chrome_options = ChromeOptions()
+        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument(f"user-agent={CRAWLER_USER_AGENT}")
+        service = ChromeService(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        driver.set_page_load_timeout(SELENIUM_PAGE_LOAD_TIMEOUT)
+        driver.get(url)
+        WebDriverWait(driver, SELENIUM_PAGE_LOAD_TIMEOUT).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        time.sleep(SELENIUM_RENDER_WAIT_SECONDS)
+        return driver.page_source
+    except (TimeoutException, WebDriverException) as e:
+        logger.warning(f"Selenium fetch failed for {url}: {e}")
+        return None
+    finally:
+        if driver:
+            driver.quit()
+
+
+def scrape_single_page(url: str, use_selenium: bool = False, include_screenshot: bool = False,
+                       include_brand_kit: bool = False) -> dict:
     """Synchronously scrape and extract structured knowledge from a single URL."""
     # Validate URL accessibility
     try:
-        head_resp = requests.head(url, headers={'User-Agent': CRAWLER_USER_AGENT}, timeout=10, allow_redirects=True)
+        head_resp = SESSION.head(url, timeout=10, allow_redirects=True)
         if head_resp.status_code >= 400:
             raise ValueError(f"URL returned HTTP {head_resp.status_code}")
     except requests.exceptions.RequestException as e:
@@ -936,23 +1135,7 @@ def scrape_single_page(url: str, use_selenium: bool = False, include_screenshot:
     if use_selenium:
         if not SELENIUM_AVAILABLE:
             raise RuntimeError("Selenium is not available on this server.")
-        driver = None
-        try:
-            chrome_options = ChromeOptions()
-            chrome_options.add_argument("--headless")
-            chrome_options.add_argument("--no-sandbox")
-            chrome_options.add_argument("--disable-dev-shm-usage")
-            chrome_options.add_argument(f"user-agent={CRAWLER_USER_AGENT}")
-            service = ChromeService(ChromeDriverManager().install())
-            driver = webdriver.Chrome(service=service, options=chrome_options)
-            driver.set_page_load_timeout(SELENIUM_PAGE_LOAD_TIMEOUT)
-            driver.get(url)
-            WebDriverWait(driver, SELENIUM_PAGE_LOAD_TIMEOUT).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-            time.sleep(SELENIUM_RENDER_WAIT_SECONDS)
-            html = driver.page_source
-        finally:
-            if driver:
-                driver.quit()
+        html = fetch_page_html_via_selenium(url)
     else:
         html = fetch_url_html_content(url)
 
@@ -966,54 +1149,65 @@ def scrape_single_page(url: str, use_selenium: bool = False, include_screenshot:
         screenshot_b64 = capture_full_page_screenshot(url)
         screenshot_captured = screenshot_b64 is not None
 
+    cost = CostAccumulator()
+
     # Detect language
     html_snippet = html[:MAX_HTML_SNIPPET_FOR_LANG_DETECT]
-    lang, _, _ = detect_language_from_html_with_openai(html_snippet, url)
+    lang, lang_p, lang_c = detect_language_from_html_with_openai(html_snippet, url)
+    cost.add(OPENAI_MODEL_CHEAP, lang_p, lang_c)
 
     # Get page title
     title = get_page_title_from_html(html)
 
     # Extract knowledge
     result, p_tokens, c_tokens = extract_knowledge_from_page_with_openai(html, url, title, lang, screenshot_b64)
+    cost.add(OPENAI_MODEL_CHEAP, p_tokens, c_tokens)
 
-    # Compute cost
-    input_cost = (p_tokens / 1_000_000) * PRICE_PER_INPUT_TOKEN_MILLION
-    output_cost = (c_tokens / 1_000_000) * PRICE_PER_OUTPUT_TOKEN_MILLION
-
-    return {
+    # Free deterministic extras: schema.org/OpenGraph facts, optionally the brand kit.
+    structured = extract_structured_data(html, url)
+    response = {
         "status": "success",
         "url": url,
         "title": result.get("title_suggestion", title),
         "detected_language": lang,
         "extracted_content": result.get("extracted_chunk", ""),
+        "structured_data": structured,
         "screenshot_captured": screenshot_captured,
-        "cost_estimation": {
-            "total_cost_usd": f"{(input_cost + output_cost):.6f}",
-            "prompt_tokens": p_tokens,
-            "completion_tokens": c_tokens
-        }
+        "cost_estimation": cost.cost_estimation()
     }
+    if include_brand_kit:
+        try:
+            response["brand_kit"] = build_brand_kit(
+                html, url, screenshot_b64, structured,
+                session=SESSION, url_validator=validate_public_http_url,
+                reports_dir=REPORTS_DIR)
+        except Exception as e:
+            logger.warning(f"Brand kit extraction failed for {url}: {e}")
+            response["brand_kit"] = None
+    return response
 
 
 # --- OpenAI Helper Functions (Feature-Specific) ---
 
 # For Company Analysis
-def analyze_single_page_with_openai(page_content: str, url: str) -> str:
-    if not openai_client: raise ConnectionError("OpenAI client not initialized.")
+def analyze_single_page_with_openai(page_content: str, url: str, cost: CostAccumulator = None) -> str:
     prompt = f"Analyze ONLY the following text content from '{url}'. Describe the page's purpose. Be concise (1-2 sentences). Content: ```{page_content}```"
-    completion = openai_client.chat.completions.create(model=OPENAI_MODEL, messages=[{"role": "user", "content": prompt}], max_completion_tokens=MAX_RESPONSE_TOKENS_PAGE)
-    return completion.choices[0].message.content.strip()
+    content, _, _ = llm_chat([{"role": "user", "content": prompt}],
+                             max_tokens=MAX_RESPONSE_TOKENS_PAGE, cost=cost,
+                             input_text_for_count=prompt)
+    return content
 
-def summarize_company_with_openai(page_summaries: list[dict], root_url: str) -> str:
-    if not openai_client: raise ConnectionError("OpenAI client not initialized.")
+def summarize_company_with_openai(page_summaries: list[dict], root_url: str, cost: CostAccumulator = None) -> str:
     combined_text = f"Based on analyses of pages from {root_url}:\n\n" + "\n".join([f"- URL: {s['url']}\n  Summary: {s['description']}" for s in page_summaries])
     prompt = f"Synthesize these descriptions into a comprehensive overview of the company at {root_url}. Describe its main purpose, offerings, and mission. Summaries:\n{combined_text}"
-    completion = openai_client.chat.completions.create(model=OPENAI_MODEL, messages=[{"role": "user", "content": prompt}], max_completion_tokens=MAX_RESPONSE_TOKENS_SUMMARY)
-    return completion.choices[0].message.content.strip()
+    content, _, _ = llm_chat([{"role": "user", "content": prompt}],
+                             max_tokens=MAX_RESPONSE_TOKENS_SUMMARY, cost=cost,
+                             input_text_for_count=prompt)
+    return content
 
 # For Prospect Qualification
-def qualify_prospect_with_openai(page_content: str, prospect_url: str, user_profile: str, user_personas: list[str]):
-    if not openai_client: raise ConnectionError("OpenAI client not initialized.")
+def qualify_prospect_with_openai(page_content: str, prospect_url: str, user_profile: str,
+                                 user_personas: list[str], cost: CostAccumulator = None):
     personas_str = "\n".join([f"- {p}" for p in user_personas])
     prompt = f"""You are a B2B sales analyst. Determine if a company is a good potential customer based on their website.
     **My Business Profile:** {user_profile}
@@ -1029,12 +1223,10 @@ def qualify_prospect_with_openai(page_content: str, prospect_url: str, user_prof
       "reasoning_for": "Why this company IS a good fit.",
       "reasoning_against": "Why this company might NOT be a good fit."
     }}"""
-    completion = openai_client.chat.completions.create(
-        model=OPENAI_MODEL, messages=[{"role": "user", "content": prompt}],
-        max_completion_tokens=MAX_RESPONSE_TOKENS_PROSPECT, response_format={"type": "json_object"}
-    )
-    result_json = json.loads(completion.choices[0].message.content)
-    return result_json, completion.usage
+    content, _, _ = llm_chat([{"role": "user", "content": prompt}],
+                             max_tokens=MAX_RESPONSE_TOKENS_PROSPECT, json_mode=True,
+                             cost=cost, input_text_for_count=prompt)
+    return parse_json_response(content)
 
 # For Knowledge Base Generation
 # --- Language detection (source-language aware) ---
@@ -1087,11 +1279,10 @@ def _llm_detect_language(text: str, url: str) -> tuple[str, int, int]:
         )},
         {"role": "user", "content": f"Identify the primary language of this text:\n\n{text}"},
     ]
-    p_tokens = count_tokens(text)
-    completion = openai_client.chat.completions.create(
-        model=OPENAI_MODEL_CHEAP, messages=messages, max_completion_tokens=MAX_RESPONSE_TOKENS_LANG_DETECT)
-    lang = (completion.choices[0].message.content or "").strip().lower()
-    c_tokens = completion.usage.completion_tokens if completion.usage else 0
+    content, p_tokens, c_tokens = llm_chat(messages, model=OPENAI_MODEL_CHEAP,
+                                           max_tokens=MAX_RESPONSE_TOKENS_LANG_DETECT,
+                                           input_text_for_count=text)
+    lang = content.strip().lower()
     if len(lang) == 2 and lang.isalpha():
         return lang, p_tokens, c_tokens
     return DEFAULT_TARGET_LANGUAGE, p_tokens, c_tokens
@@ -1150,118 +1341,6 @@ def detect_site_language(main_page_html: str, base_url: str, candidate_pages: li
                 return lang
 
     return DEFAULT_TARGET_LANGUAGE
-
-def analyze_all_urls_comprehensively(page_details: list[dict], root_url: str, lang: str) -> tuple[dict, int, int]:
-    """Analyze ALL discovered URLs and categorize them comprehensively."""
-    if not openai_client: raise ConnectionError("OpenAI client not initialized.")
-    
-    # Prepare URL list for analysis
-    urls_list = [p['url'] for p in page_details]
-    
-    # If too many URLs, sample them intelligently with priority for important pages
-    if len(urls_list) > 300:  # Reduced limit for better reliability
-        import random
-        random.seed(42)
-        
-        # Prioritize important pages
-        priority_urls = []
-        regular_urls = []
-        
-        for url in urls_list:
-            url_lower = url.lower()
-            if any(keyword in url_lower for keyword in ['about', 'contact', 'home', 'index', 'service', 'policy', 'help', 'faq', 'support', 'terms', 'privacy']):
-                priority_urls.append(url)
-            elif not any(skip in url_lower for skip in ['wp-content', 'assets', 'css', 'js', 'images', 'uploads', 'cache', 'admin', 'login', 'register', 'cart', 'checkout']):
-                regular_urls.append(url)
-        
-        # Take priority pages and sample regular pages
-        sampled_urls = priority_urls[:50]  # Take up to 50 priority pages
-        remaining_slots = 250 - len(sampled_urls)  # Leave room for 250 total URLs
-        if remaining_slots > 0 and regular_urls:
-            sampled_urls.extend(random.sample(regular_urls, min(remaining_slots, len(regular_urls))))
-        
-        urls_list = sampled_urls
-        logger.info(f"Sampled {len(urls_list)} URLs for analysis ({len(priority_urls)} priority pages found)")
-    
-    urls_text = "\n".join([f"- {url}" for url in urls_list])
-    
-    prompt = f"""Analyze ALL the following URLs from {root_url} and categorize them comprehensively.
-
-    Categorize each URL into the following categories:
-    1. company_info_pages: About us, contact, company information, policies, terms, privacy, FAQ, help, support
-    2. product_pages: Individual product pages, product categories, brand pages, shopping pages
-    3. service_pages: Services offered, features, capabilities, solutions
-    4. technical_pages: Admin, login, cart, checkout, account, API, technical pages
-    5. asset_pages: Images, CSS, JS, media files, static assets
-    6. other_pages: Any other pages that don't fit above categories
-
-    IMPORTANT: 
-    - Only include URLs that actually exist and are accessible
-    - Do not guess or assume URL patterns
-    - Be thorough and comprehensive
-    - Consider the URL structure and patterns
-
-    URLs to analyze:
-    {urls_text}
-
-    Respond with a JSON object containing arrays of URLs for each category:
-    {{
-        "company_info_pages": ["url1", "url2", ...],
-        "product_pages": ["url1", "url2", ...],
-        "service_pages": ["url1", "url2", ...],
-        "technical_pages": ["url1", "url2", ...],
-        "asset_pages": ["url1", "url2", ...],
-        "other_pages": ["url1", "url2", ...]
-    }}
-    """
-    
-    p_tokens = count_tokens(prompt)
-    completion = openai_client.chat.completions.create(
-        model=OPENAI_MODEL, messages=[{"role": "user", "content": prompt}],
-        max_completion_tokens=MAX_RESPONSE_TOKENS_PAGE_SELECTION * 2, response_format={"type": "json_object"}
-    )
-    c_tokens = completion.usage.completion_tokens if completion.usage else 0
-    
-    try:
-        response_content = completion.choices[0].message.content.strip()
-        # Try to extract JSON from the response if it's wrapped in markdown or other text
-        if '```json' in response_content:
-            json_start = response_content.find('```json') + 7
-            json_end = response_content.find('```', json_start)
-            if json_end != -1:
-                response_content = response_content[json_start:json_end].strip()
-        elif '```' in response_content:
-            json_start = response_content.find('```') + 3
-            json_end = response_content.rfind('```')
-            if json_end != -1 and json_end > json_start:
-                response_content = response_content[json_start:json_end].strip()
-        
-        response_data = json.loads(response_content)
-        return response_data, p_tokens, c_tokens
-    except (json.JSONDecodeError, TypeError) as e:
-        logger.error(f"Error parsing AI response for URL analysis: {e}")
-        logger.error(f"Raw response content: {completion.choices[0].message.content[:500]}...")
-        
-        # Return a fallback structure with improved basic categorization
-        company_keywords = ['about', 'contact', 'home', 'index', 'درباره', 'تماس', 'قوانین', 'شرایط', 'privacy', 'policy', 'terms', 'faq', 'help', 'support']
-        service_keywords = ['service', 'support', 'help', 'خدمات', 'پشتیبانی', 'راهنما']
-        skip_keywords = ['login', 'register', 'cart', 'checkout', 'wp-admin', 'wp-content', 'assets', 'css', 'js', 'images']
-        
-        company_pages = [page['url'] for page in page_details[:20] if any(keyword in page['url'].lower() for keyword in company_keywords)]
-        service_pages = [page['url'] for page in page_details[:20] if any(keyword in page['url'].lower() for keyword in service_keywords)]
-        product_pages = [page['url'] for page in page_details[:15] if not any(keyword in page['url'].lower() for keyword in skip_keywords + company_keywords + service_keywords)]
-        
-        fallback_response = {
-            "company_info_pages": company_pages,
-            "product_pages": product_pages,
-            "service_pages": service_pages,
-            "categories_summary": "Unable to perform detailed analysis due to parsing error, using enhanced URL pattern matching with Persian keywords"
-        }
-        logger.info(f"Using fallback categorization: {len(fallback_response['company_info_pages'])} company, {len(fallback_response['product_pages'])} product, {len(fallback_response['service_pages'])} service pages")
-        return fallback_response, p_tokens, c_tokens
-
-# Product catalog generation removed - focusing on knowledge base creation for chatbots
-# If categories are found during analysis, they will be mentioned in the knowledge base
 
 def identify_knowledge_rich_content_clusters(page_details: list[dict], root_url: str, lang: str) -> tuple[dict, int, int]:
     """Identify and prioritize knowledge-rich content clusters for chatbot training."""
@@ -1372,32 +1451,15 @@ Output this JSON schema:
         }
     ]
 
-    p_tokens = count_tokens(urls_text)
-    completion = openai_client.chat.completions.create(
-        model=OPENAI_MODEL, messages=messages,
-        max_completion_tokens=MAX_RESPONSE_TOKENS_PAGE_SELECTION * 2, response_format={"type": "json_object"}
-    )
-    c_tokens = completion.usage.completion_tokens if completion.usage else 0
-    
+    content, p_tokens, c_tokens = llm_chat(messages, model=OPENAI_MODEL_CHEAP,
+                                           max_tokens=MAX_RESPONSE_TOKENS_PAGE_SELECTION * 2,
+                                           json_mode=True, input_text_for_count=urls_text)
     try:
-        response_content = completion.choices[0].message.content.strip()
-        # Try to extract JSON from the response if it's wrapped in markdown or other text
-        if '```json' in response_content:
-            json_start = response_content.find('```json') + 7
-            json_end = response_content.find('```', json_start)
-            if json_end != -1:
-                response_content = response_content[json_start:json_end].strip()
-        elif '```' in response_content:
-            json_start = response_content.find('```') + 3
-            json_end = response_content.rfind('```')
-            if json_end != -1 and json_end > json_start:
-                response_content = response_content[json_start:json_end].strip()
-        
-        response_data = json.loads(response_content)
+        response_data = parse_json_response(content)
         return response_data, p_tokens, c_tokens
-    except (json.JSONDecodeError, TypeError) as e:
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing knowledge cluster analysis: {e}")
-        logger.error(f"Raw response content: {completion.choices[0].message.content[:500]}...")
+        logger.error(f"Raw response content: {content[:500]}...")
         
         # Enhanced fallback with knowledge-focused categorization
         knowledge_patterns = ['how-to', 'guide', 'tutorial', 'tips', 'best-', 'what-is', 'vs-', 'install', 'درباره', 'تماس', 'راهنما', 'آموزش']
@@ -1445,70 +1507,6 @@ Output this JSON schema:
         logger.info(f"Using fallback knowledge cluster analysis: {fallback_response['total_knowledge_pages_identified']} knowledge pages identified")
         return fallback_response, p_tokens, c_tokens
 
-def compile_comprehensive_knowledge_base(extracted_content: dict, knowledge_clusters: dict, base_url: str, lang: str) -> tuple[str, int, int]:
-    """Compile a comprehensive knowledge base from knowledge clusters."""
-    if not openai_client: raise ConnectionError("OpenAI client not initialized.")
-    
-    # Prepare content sections from knowledge clusters
-    content_sections = {}
-    
-    for cluster_name, cluster_content in extracted_content.items():
-        if cluster_content:
-            cluster_text = "\n\n".join([chunk.get('extracted_chunk', '') for chunk in cluster_content])
-            content_sections[cluster_name] = cluster_text
-    
-    # Prepare comprehensive prompt with knowledge cluster sections
-    content_sections_text = ""
-    for cluster_name, cluster_text in content_sections.items():
-        section_title = cluster_name.replace('_', ' ').title()
-        content_sections_text += f"\n\n{section_title.upper()}:\n{cluster_text}"
-    
-    prompt = f"""Create a COMPREHENSIVE and DETAILED knowledge base for {base_url} in {lang}.
-
-    Use ALL the following information extracted from knowledge-rich content clusters to create the most complete knowledge base possible:
-
-    {content_sections_text}
-
-    KNOWLEDGE ANALYSIS SUMMARY:
-    - Total knowledge pages identified: {knowledge_clusters.get('total_knowledge_pages_identified', 0)}
-    - Analysis summary: {knowledge_clusters.get('analysis_summary', 'Knowledge cluster analysis completed')}
-    - Content clusters processed: {', '.join(extracted_content.keys())}
-
-    CRITICAL REQUIREMENTS FOR CHATBOT KNOWLEDGE BASE:
-    1. Create a VERY DETAILED and COMPREHENSIVE knowledge base optimized for AI chatbot use
-    2. Include ALL information from all knowledge clusters in a structured, searchable format
-    3. Create SEPARATE, DETAILED SECTIONS for each knowledge cluster type
-    4. Focus EXCLUSIVELY on educational content, company information, troubleshooting guides, and customer service information
-    5. COMPLETELY AVOID product specifications, individual product details, or product catalogs
-    6. Use proper Markdown formatting with clear hierarchical structure (##, ###, ####)
-    7. Write entirely in {lang}
-    8. Include comprehensive tables, lists, and structured information that chatbots can easily parse
-    9. Be extremely detailed with step-by-step instructions, complete procedures, and actionable information
-    10. Include all contact details, policies, procedures, and FAQ-type information
-    11. Structure content for optimal chatbot knowledge retrieval and customer assistance
-    12. Create in-depth sections for:
-        - Educational tutorials and how-to guides (with complete step-by-step instructions)
-        - Troubleshooting guides (with detailed problem-solving steps)
-        - Company information and policies (comprehensive contact info, terms, procedures)
-        - Technical explanations (detailed concept definitions and explanations)
-        - Buying guides (general advice and comparison criteria, NOT specific products)
-        - Service information (support processes, warranty info, service procedures)
-    13. Make each section comprehensive enough to answer complex customer questions
-    14. Focus on KNOWLEDGE that helps customers learn, understand, and solve problems
-    15. Avoid any product pricing, product specifications, or individual product recommendations
-
-    Create a professional, well-structured, comprehensive knowledge base document optimized for AI chatbot customer service use, with detailed separate sections for each knowledge cluster.
-    """
-    
-    p_tokens = count_tokens(prompt)
-    completion = openai_client.chat.completions.create(
-        model=OPENAI_MODEL, messages=[{"role": "user", "content": prompt}],
-        max_completion_tokens=MAX_RESPONSE_TOKENS_KB_COMPILATION
-    )
-    c_tokens = completion.usage.completion_tokens if completion.usage else 0
-
-    return completion.choices[0].message.content.strip(), p_tokens, c_tokens
-        
 def extract_website_colors_with_openai(html_content: str, url: str, screenshot_base64: str = None) -> tuple[dict, int, int]:
     """Extract website background color and primary brand color using AI analysis."""
     if not openai_client: 
@@ -1541,25 +1539,13 @@ def extract_website_colors_with_openai(html_content: str, url: str, screenshot_b
     }}
     
     HTML Content: ```{html_content[:5000]}```"""
-    
-    p_tokens = count_tokens(prompt)
-    completion = openai_client.chat.completions.create(
-        model=OPENAI_MODEL_CHEAP, messages=[{"role": "user", "content": prompt}],
-        max_completion_tokens=300, response_format={"type": "json_object"}
-    )
-    c_tokens = completion.usage.completion_tokens if completion.usage else 0
-    
+
+    content, p_tokens, c_tokens = llm_chat([{"role": "user", "content": prompt}],
+                                           model=OPENAI_MODEL_CHEAP, max_tokens=300,
+                                           json_mode=True, input_text_for_count=prompt)
     try:
-        response_content = completion.choices[0].message.content.strip()
-        # Handle potential markdown wrapping
-        if '```json' in response_content:
-            json_start = response_content.find('```json') + 7
-            json_end = response_content.find('```', json_start)
-            if json_end != -1:
-                response_content = response_content[json_start:json_end].strip()
-        
-        return json.loads(response_content), p_tokens, c_tokens
-    except (json.JSONDecodeError, TypeError) as e:
+        return parse_json_response(content), p_tokens, c_tokens
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing color extraction response: {e}")
         # Return a fallback response
         return {
@@ -1635,15 +1621,11 @@ PAGE CONTENT:
         {"role": "user", "content": user_content_parts},
     ]
 
-    completion = openai_client.chat.completions.create(
-        model=OPENAI_MODEL_CHEAP, messages=messages,
-        max_completion_tokens=MAX_RESPONSE_TOKENS_PAGE_EXTRACTION, response_format={"type": "json_object"}
-    )
-    usage = completion.usage
-    p_tokens = usage.prompt_tokens if usage else count_tokens(clean_text)
-    c_tokens = usage.completion_tokens if usage else 0
+    content, p_tokens, c_tokens = llm_chat(messages, model=OPENAI_MODEL_CHEAP,
+                                           max_tokens=MAX_RESPONSE_TOKENS_PAGE_EXTRACTION,
+                                           json_mode=True, input_text_for_count=clean_text)
     try:
-        data = parse_json_response(completion.choices[0].message.content)
+        data = parse_json_response(content)
         cat = str(data.get("primary_category", "")).strip().lower()
         if cat not in KB_SECTION_KEYS:
             cat = "additional"
@@ -1660,56 +1642,6 @@ PAGE CONTENT:
             "primary_category": "additional",
             "extracted_chunk": ""
         }, p_tokens, c_tokens
-
-def compile_final_knowledge_base_with_openai(chunks: list[dict], url: str, lang: str) -> tuple[str, int, int]:
-    if not openai_client: raise ConnectionError("OpenAI client not initialized.")
-    guidelines = KB_WRITING_GUIDELINES_TEMPLATE.format(target_language=lang)
-    chunks_text = "\n\n".join([f"--- Chunk from {c.get('url', 'N/A')} ---\nTitle: {c.get('title_suggestion', 'N/A')}\nContent:\n{c.get('extracted_chunk', 'N/A')}" for c in chunks])
-    messages = [
-        {
-            "role": "developer",
-            "content": (
-                f"You are a technical writer creating a structured knowledge base in {lang}. "
-                f"Synthesize multiple page extracts into a single, deduplicated Markdown document. "
-                f"Remove duplicate information. Resolve conflicts by keeping the most complete version."
-            )
-        },
-        {
-            "role": "user",
-            "content": f"""Compile these page extracts from {url} into one cohesive knowledge base.
-
-Required document structure (use ## for each section that has data):
-## Company Overview
-## Contact Information
-## Products & Services
-## Policies (Shipping / Returns / Warranty / Privacy / Terms)
-## FAQ
-## How to Order / Payment Methods
-## Support & Troubleshooting
-## Additional Information
-
-Rules:
-- Write entirely in {lang}
-- Deduplicate: merge repeated information, do not list the same fact twice
-- Use tables where data is tabular
-- Use numbered lists for step-by-step processes
-- Include all phone numbers, addresses, emails verbatim
-- Include all policy clauses verbatim (do not paraphrase legal text)
-
-Guidelines:
-{guidelines}
-
-Page extracts:
-{chunks_text}"""
-        }
-    ]
-    p_tokens = count_tokens(chunks_text)
-    completion = openai_client.chat.completions.create(
-        model=OPENAI_MODEL, messages=messages, max_completion_tokens=MAX_RESPONSE_TOKENS_KB_COMPILATION
-    )
-    c_tokens = completion.usage.completion_tokens if completion.usage else 0
-    return completion.choices[0].message.content.strip(), p_tokens, c_tokens
-
 
 # --- Report Helpers ---
 def save_results_to_csv(job_id: str, results_data: list):
@@ -1805,71 +1737,79 @@ def save_knowledge_base_report(job_id: str, url: str, knowledge_base: str, metad
 
 def run_company_analysis_job(job_id, url, max_pages, use_selenium):
     logger.info(f"Starting analysis job {job_id} for {url}")
-    with jobs_lock: jobs[job_id]["status"] = "running"
-    
+    with jobs_lock: jobs[job_id].update({"status": "running", "started_at": time.time()})
+    cost = CostAccumulator()
+
     try:
         crawl_func = selenium_crawl_website if use_selenium else simple_crawl_website
         found_pages = crawl_func(url, max_pages)
-        
+
         page_summaries = []
         for i, page in enumerate(found_pages):
             with jobs_lock: jobs[job_id]["progress"] = f"Analyzing page {i+1}/{len(found_pages)}"
             try:
                 content = fetch_url_content(page['url'])
                 if content:
-                    summary = analyze_single_page_with_openai(content, page['url'])
+                    summary = analyze_single_page_with_openai(content, page['url'], cost)
                     page_summaries.append({'url': page['url'], 'description': summary})
             except Exception as e:
                 logger.error(f"Failed to analyze page {page['url']}: {e}")
-        
+
         with jobs_lock: jobs[job_id]["progress"] = "Summarizing company..."
-        final_summary = summarize_company_with_openai(page_summaries, url)
-        
+        final_summary = summarize_company_with_openai(page_summaries, url, cost)
+
         with jobs_lock:
             jobs[job_id].update({
                 "status": "completed",
-                "results": {"company_summary": final_summary, "analyzed_pages": page_summaries}
+                "results": {"company_summary": final_summary, "analyzed_pages": page_summaries},
+                "cost_estimation": cost.cost_estimation(),
+                "finished_at": time.time(),
             })
     except Exception as e:
         logger.error(f"Job {job_id} failed: {e}", exc_info=True)
-        with jobs_lock: jobs[job_id].update({"status": "failed", "error": str(e)})
+        with jobs_lock:
+            jobs[job_id].update({"status": "failed", "error": str(e), "finished_at": time.time()})
 
 def run_prospect_qualification_job(job_id, user_profile, user_personas, prospect_urls):
     logger.info(f"Starting prospect qualification job {job_id}")
-    with jobs_lock: jobs[job_id]["status"] = "running"
-    
+    with jobs_lock: jobs[job_id].update({"status": "running", "started_at": time.time()})
+    cost = CostAccumulator()
     results = []
-    total_prompt_tokens, total_completion_tokens = 0, 0
-    for i, url in enumerate(prospect_urls):
-        with jobs_lock: jobs[job_id]["progress"] = f"Qualifying {i+1}/{len(prospect_urls)}: {url}"
-        result_entry = {"url": url, "status": "pending", "analysis": None, "error": None}
-        try:
-            page_content = fetch_url_content(url)
-            if not page_content.strip(): raise ValueError("Fetched content is empty.")
-            
-            analysis, usage = qualify_prospect_with_openai(page_content, url, user_profile, user_personas)
-            result_entry.update({"status": "completed", "analysis": analysis})
-            total_prompt_tokens += usage.prompt_tokens
-            total_completion_tokens += usage.completion_tokens
-        except Exception as e:
-            result_entry.update({"status": "failed", "error": str(e)})
-        results.append(result_entry)
-    
-    csv_report_path = save_results_to_csv(job_id, results)
-    input_cost = (total_prompt_tokens / 1_000_000) * PRICE_PER_INPUT_TOKEN_MILLION
-    output_cost = (total_completion_tokens / 1_000_000) * PRICE_PER_OUTPUT_TOKEN_MILLION
-    
-    with jobs_lock:
-        jobs[job_id].update({
-            "status": "completed",
-            "results": results,
-            "csv_report_path": csv_report_path,
-            "cost_estimation": {
-                "total_cost_usd": f"{(input_cost + output_cost):.6f}",
-                "prompt_tokens": total_prompt_tokens,
-                "completion_tokens": total_completion_tokens
-            }
-        })
+
+    try:
+        for i, url in enumerate(prospect_urls):
+            with jobs_lock: jobs[job_id]["progress"] = f"Qualifying {i+1}/{len(prospect_urls)}: {url}"
+            result_entry = {"url": url, "status": "pending", "analysis": None, "error": None}
+            try:
+                page_content = fetch_url_content(url)
+                if not page_content.strip(): raise ValueError("Fetched content is empty.")
+
+                analysis = qualify_prospect_with_openai(page_content, url, user_profile, user_personas, cost)
+                result_entry.update({"status": "completed", "analysis": analysis})
+            except Exception as e:
+                result_entry.update({"status": "failed", "error": str(e)})
+            results.append(result_entry)
+
+        csv_report_path = save_results_to_csv(job_id, results)
+        with jobs_lock:
+            jobs[job_id].update({
+                "status": "completed",
+                "results": results,
+                "csv_report_path": csv_report_path,
+                "cost_estimation": cost.cost_estimation(),
+                "finished_at": time.time(),
+            })
+    except Exception as e:
+        # Top-level guard so the job can never get stuck in "running"; keep partial results.
+        logger.error(f"Prospect job {job_id} failed: {e}", exc_info=True)
+        with jobs_lock:
+            jobs[job_id].update({
+                "status": "failed",
+                "error": str(e),
+                "results": results,
+                "cost_estimation": cost.cost_estimation(),
+                "finished_at": time.time(),
+            })
 
 # =====================================================================================
 # Overhauled KB pipeline: discovery -> deterministic pre-filter -> AI selection ->
@@ -1904,6 +1844,25 @@ def _looks_like_product_url(path_lower: str) -> bool:
     """Heuristic for individual product-detail pages (skipped for a knowledge base)."""
     return any(h in path_lower for h in ('/product/', '/products/', '/dp/', '/item/',
                                          '/sku/', '/-p-', '/buy/', '/محصول/', '/کالا/'))
+
+
+# URL-path hints that almost always mark a knowledge page (English + Persian slugs).
+_KNOWLEDGE_PATH_HINTS = (
+    'about', 'contact', 'faq', 'policy', 'policies', 'terms', 'privacy', 'shipping',
+    'delivery', 'return', 'refund', 'warranty', 'guarantee', 'support', 'help', 'guide',
+    'how-to', 'howto', 'tutorial', 'service', 'payment', 'branch', 'location',
+    'درباره', 'تماس', 'قوانین', 'شرایط', 'حریم', 'ارسال', 'بازگشت', 'گارانتی',
+    'سوالات', 'پرسش', 'راهنما', 'خدمات', 'پرداخت', 'آموزش', 'نمایندگی', 'شعب',
+)
+
+
+def knowledge_path_score(url: str) -> float:
+    """Deterministic knowledge-richness score for a URL path; >= 2.0 means an obvious
+    knowledge page that can be selected without asking an LLM."""
+    path = unquote(urlparse(url).path or '/').lower()
+    score = sum(2.0 for h in _KNOWLEDGE_PATH_HINTS if h in path)
+    depth = max(0, len([seg for seg in path.split('/') if seg]) - 1)
+    return score - 0.25 * depth
 
 
 def prefilter_candidate_urls(urls: list, base_domain: str, keep_product_sample: int = 15):
@@ -1963,13 +1922,13 @@ def prefilter_candidate_urls(urls: list, base_domain: str, keep_product_sample: 
 def discover_all_candidate_urls(base_url: str, use_selenium: bool = False):
     """Discover candidate page URLs: sitemap first (scales to huge sites), crawl fallback.
 
-    Returns (candidate_urls_including_base, discovery_meta).
+    Returns (candidate_urls_including_base, discovery_meta, sitemap_meta_by_url).
     """
     meta = {"sitemap_urls": 0, "crawled_urls": 0, "method": None, "capped": False}
 
-    sitemap_urls = []
+    sitemap_urls, sitemap_meta = [], {}
     try:
-        sitemap_urls = find_sitemap_urls(base_url)
+        sitemap_urls, sitemap_meta = find_sitemap_urls(base_url)
     except Exception as e:
         logger.warning(f"Sitemap discovery failed for {base_url}: {e}")
     meta["sitemap_urls"] = len(sitemap_urls)
@@ -1998,19 +1957,30 @@ def discover_all_candidate_urls(base_url: str, use_selenium: bool = False):
         logger.info(f"Discovery cap hit: {len(candidates)} URLs -> {MAX_DISCOVERY_URLS}")
         candidates = candidates[:MAX_DISCOVERY_URLS]
 
-    return candidates, meta
+    return candidates, meta, sitemap_meta
 
 
 def select_knowledge_pages(base_url: str, candidate_urls: list, lang: str, page_budget: int,
-                           cost: CostAccumulator):
+                           cost: CostAccumulator, sitemap_meta: dict = None):
     """Pick the most knowledge-rich pages to deeply extract, within page_budget.
 
     Pipeline: deterministic pre-filter -> AI cluster categorisation (cheap model) ->
-    priority-ordered selection. Always includes the site's main page.
+    priority-ordered selection. Always includes the site's main page. When the sitemap
+    provides <priority>/<lastmod>, higher-priority / fresher pages are preferred in the
+    deterministic ordering.
     Returns (selected_pages, selection_meta); each page is {url, cluster}.
     """
     base_domain = urlparse(base_url).netloc
     kept, dropped_counts = prefilter_candidate_urls(candidate_urls, base_domain)
+    if sitemap_meta:
+        # Prefer pages the site itself marks important. Two stable sorts: newest
+        # lastmod first (ISO-8601 sorts lexicographically), then priority desc, so the
+        # final order is priority-major with recency as tie-breaker.
+        kept.sort(key=lambda u: (sitemap_meta.get(u) or {}).get('lastmod') or '', reverse=True)
+        def _priority_of(u):
+            p = (sitemap_meta.get(u) or {}).get('priority')
+            return p if p is not None else 0.5
+        kept.sort(key=_priority_of, reverse=True)
     logger.info(f"Pre-filter kept {len(kept)} of {len(candidate_urls)} URLs; dropped {dropped_counts}")
 
     selection_meta = {
@@ -2018,6 +1988,8 @@ def select_knowledge_pages(base_url: str, candidate_urls: list, lang: str, page_
         "after_prefilter": len(kept),
         "dropped_by_reason": dropped_counts,
         "clusters": None,
+        "auto_selected_by_keyword": 0,
+        "llm_selection_skipped": False,
     }
 
     base_norm = urlparse(base_url)._replace(fragment="").geturl()
@@ -2035,9 +2007,23 @@ def select_knowledge_pages(base_url: str, candidate_urls: list, lang: str, page_
 
     _add(base_norm, "company_information")
 
-    if len(kept) > 1:
+    # Deterministic auto-selection: URLs whose path screams knowledge page
+    # (about/contact/faq/policy/... incl. Persian slugs) skip the LLM entirely.
+    for score, u in sorted(((knowledge_path_score(u), u) for u in kept), reverse=True):
+        if score < 2.0 or len(selected) >= page_budget:
+            break
+        _add(u, "auto_keyword")
+    selection_meta["auto_selected_by_keyword"] = max(0, len(selected) - 1)
+
+    remaining = [u for u in kept if u not in seen]
+    if remaining and len(selected) + len(remaining) <= page_budget:
+        # Everything fits in the budget — AI ranking would change nothing but cost.
+        for u in remaining:
+            _add(u, "company_information")
+        selection_meta["llm_selection_skipped"] = True
+    elif remaining and len(selected) < page_budget:
         try:
-            page_details = [{"url": u} for u in kept]
+            page_details = [{"url": u} for u in remaining]
             clusters, p, c = identify_knowledge_rich_content_clusters(page_details, base_url, lang)
             cost.add(OPENAI_MODEL_CHEAP, p, c)
             selection_meta["clusters"] = {
@@ -2093,15 +2079,24 @@ def harvest_contact_candidates(texts: list) -> dict:
 
 def extract_pages_parallel(pages: list, lang: str, cost: CostAccumulator,
                            main_page_url: str = None, main_page_screenshot: str = None,
-                           job_id: str = None) -> list:
+                           job_id: str = None):
     """Fetch + clean + extract knowledge for many pages concurrently (cheap model).
 
-    Returns chunk dicts: {url, title_suggestion, primary_category, extracted_chunk}.
+    Pages whose HTML is substantial but whose clean text is tiny look JS-rendered;
+    those are re-fetched once through headless Chrome (bounded per job) so SPA sites
+    work without the caller having to guess `use_selenium` upfront.
+
+    Returns (chunks, structured_facts_list) where chunks are
+    {url, title_suggestion, primary_category, extracted_chunk} and the second item
+    holds the free deterministic JSON-LD/OpenGraph harvest of every fetched page.
     """
     results = []
+    structured_list = []
     results_lock = threading.Lock()
     total = len(pages)
     done = {"n": 0}
+    selenium_budget = {"n": 0}
+    stats = {"cache_hits": 0, "selenium_fallbacks": 0}
 
     def _work(page):
         url = page["url"]
@@ -2109,11 +2104,49 @@ def extract_pages_parallel(pages: list, lang: str, cost: CostAccumulator,
             html = fetch_url_html_content(url)
             if not html:
                 return None
+
+            # JS-rendered page? Retry once through Selenium within the per-job budget.
+            clean_probe = clean_text_from_html(html, url)
+            if (SELENIUM_AVAILABLE and len(clean_probe) < SELENIUM_FALLBACK_MIN_TEXT
+                    and len(html) > SELENIUM_FALLBACK_MIN_HTML):
+                with results_lock:
+                    allowed = selenium_budget["n"] < SELENIUM_FALLBACK_MAX_PAGES
+                    if allowed:
+                        selenium_budget["n"] += 1
+                if allowed:
+                    rendered = fetch_page_html_via_selenium(url)
+                    if rendered and len(clean_text_from_html(rendered, url)) > len(clean_probe):
+                        logger.info(f"Selenium fallback improved content for {url}")
+                        html = rendered
+                        clean_probe = clean_text_from_html(html, url)
+                        with results_lock:
+                            stats["selenium_fallbacks"] += 1
+
+            try:
+                sd = extract_structured_data(html, url)
+                with results_lock:
+                    structured_list.append(sd)
+            except Exception as e:
+                logger.debug(f"Structured-data harvest failed for {url}: {e}")
+
             title = get_page_title_from_html(html) or page.get("title", "N/A")
             screenshot = main_page_screenshot if (main_page_url and url == main_page_url) else None
-            data, p, c = extract_knowledge_from_page_with_openai(html, url, title, lang, screenshot)
-            cost.add(OPENAI_MODEL_CHEAP, p, c)
+
+            content_hash = hashlib.sha256(clean_probe.encode('utf-8', 'ignore')).hexdigest()
+            data = None
+            if not screenshot:  # screenshot-augmented extractions aren't cache-equivalent
+                data = load_cached_extraction(url, lang, content_hash)
+            if data is not None:
+                with results_lock:
+                    stats["cache_hits"] += 1
+                logger.info(f"Extraction cache hit for {url}")
+            else:
+                data, p, c = extract_knowledge_from_page_with_openai(html, url, title, lang, screenshot)
+                cost.add(OPENAI_MODEL_CHEAP, p, c)
+                if data and not screenshot:
+                    store_cached_extraction(url, lang, content_hash, data, OPENAI_MODEL_CHEAP)
             if data and data.get("extracted_chunk", "").strip():
+                data = dict(data)
                 data.setdefault("cluster", page.get("cluster"))
                 return data
             return None
@@ -2134,7 +2167,9 @@ def extract_pages_parallel(pages: list, lang: str, cost: CostAccumulator,
             if r:
                 with results_lock:
                     results.append(r)
-    return results
+    if stats["cache_hits"]:
+        logger.info(f"Extraction cache: {stats['cache_hits']}/{total} pages served for free")
+    return results, structured_list, stats
 
 
 def _batch_chunks_by_tokens(texts: list, token_budget: int) -> list:
@@ -2330,13 +2365,37 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
         if not main_page_screenshot:
             logger.warning("Could not capture main page screenshot - continuing without visual context")
 
-        # 2.5 Website colors (kept for response-shape compatibility)
+        # 2.5 Brand kit: deterministic logo / palette / fonts / socials measured from the
+        # real site (CSS + screenshot pixels + schema.org). The old LLM color guess only
+        # runs as a fallback when nothing could be measured.
         update_job_progress(job_id, "Extracting website colors...")
         website_colors = {
             "main_background_color": "#ffffff", "primary_brand_color": "#000000",
             "background_color_description": "Default fallback", "brand_color_description": "Default fallback",
         }
+        homepage_structured = None
+        brand_kit_data = {}
         if main_page_html:
+            try:
+                homepage_structured = extract_structured_data(main_page_html, base_url)
+            except Exception as e:
+                logger.debug(f"Homepage structured-data harvest failed: {e}")
+            try:
+                brand_kit_data = build_brand_kit(
+                    main_page_html, base_url, main_page_screenshot, homepage_structured,
+                    session=SESSION, url_validator=validate_public_http_url,
+                    reports_dir=REPORTS_DIR)
+            except Exception as e:
+                logger.warning(f"Brand kit extraction failed: {e}")
+        palette = (brand_kit_data or {}).get("palette") or {}
+        if palette.get("primary"):
+            website_colors = {
+                "main_background_color": palette.get("background") or "#ffffff",
+                "primary_brand_color": palette["primary"],
+                "background_color_description": "Measured from the page screenshot (dominant background).",
+                "brand_color_description": "Measured deterministically from CSS variables / theme-color / screenshot pixels.",
+            }
+        elif main_page_html:
             try:
                 colors, p, c = extract_website_colors_with_openai(main_page_html, base_url, main_page_screenshot)
                 website_colors = colors
@@ -2358,9 +2417,10 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
             discovery_meta = {"method": "core_patterns", "count": len(selected)}
         else:
             update_job_progress(job_id, "Discovering all pages (Sitemap)...")
-            candidates, discovery_meta = discover_all_candidate_urls(base_url, use_selenium)
+            candidates, discovery_meta, sitemap_meta = discover_all_candidate_urls(base_url, use_selenium)
             update_job_progress(job_id, "Identifying knowledge-rich content clusters...")
-            selected, selection_meta = select_knowledge_pages(base_url, candidates, lang, page_budget, cost)
+            selected, selection_meta = select_knowledge_pages(base_url, candidates, lang, page_budget,
+                                                              cost, sitemap_meta=sitemap_meta)
 
         with jobs_lock: jobs[job_id]["initial_found_pages_count"] = len(selected)
         logger.info(f"Selected {len(selected)} knowledge pages for extraction")
@@ -2371,16 +2431,31 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
         with jobs_lock: jobs[job_id]["detected_target_language"] = lang
         logger.info(f"Detected target language: {lang} ({language_name(lang)})")
 
-        # 4. Parallel per-page extraction (clean text -> cheap model)
+        # 4. Parallel per-page extraction (clean text -> cheap model) + free structured harvest
         update_job_progress(job_id, "Extracting knowledge from pages...")
-        chunks = extract_pages_parallel(
+        chunks, per_page_structured, extraction_stats = extract_pages_parallel(
             selected, lang, cost,
             main_page_url=base_url, main_page_screenshot=main_page_screenshot, job_id=job_id,
         )
         logger.info(f"Extraction complete: {len(chunks)} non-empty chunks from {len(selected)} pages")
 
+        # 4.5 Merge the deterministic JSON-LD/OpenGraph facts across pages (homepage included).
+        if homepage_structured:
+            per_page_structured.append(homepage_structured)
+        structured_facts = merge_structured_facts(per_page_structured)
+        structured_summary = structured_facts_summary_text(structured_facts)
+        if structured_summary:
+            logger.info(f"Structured facts harvested:\n{structured_summary}")
+
         # 5. Contact safety-net + group chunks by canonical section
         contact_candidates = harvest_contact_candidates([c.get("extracted_chunk", "") for c in chunks])
+        org = structured_facts.get("organization") or {}
+        for email in org.get("emails", []):
+            if email not in contact_candidates["emails"]:
+                contact_candidates["emails"].append(email)
+        for phone in org.get("phones", []):
+            if phone not in contact_candidates["phones"]:
+                contact_candidates["phones"].append(phone)
         section_chunks = {k: [] for k in KB_SECTION_KEYS}
         for ch in chunks:
             cat = ch.get("primary_category", "additional")
@@ -2390,14 +2465,31 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
 
         # 6. Per-section synthesis (strong model; map-reduce for large sections)
         section_outputs = {}
+        structured_faq = structured_facts.get("faq") or []
         for key in KB_SECTION_KEYS:
             chs = section_chunks.get(key, [])
             extra = ""
-            if key == "contact" and (contact_candidates["emails"] or contact_candidates["phones"]):
-                extra = ("Detected contact candidates (verify against the extracts and include only "
-                         "genuine ones; never fabricate):\n"
-                         f"Emails: {', '.join(contact_candidates['emails']) or 'none'}\n"
-                         f"Phones: {', '.join(contact_candidates['phones']) or 'none'}")
+            if key == "contact":
+                extra_parts = []
+                if contact_candidates["emails"] or contact_candidates["phones"]:
+                    extra_parts.append(
+                        "Detected contact candidates (verify against the extracts and include only "
+                        "genuine ones; never fabricate):\n"
+                        f"Emails: {', '.join(contact_candidates['emails']) or 'none'}\n"
+                        f"Phones: {', '.join(contact_candidates['phones']) or 'none'}")
+                if structured_summary:
+                    extra_parts.append(
+                        "Authoritative facts from the site's own structured data "
+                        "(schema.org markup — treat as ground truth):\n" + structured_summary)
+                extra = "\n\n".join(extra_parts)
+            elif key == "company_overview" and structured_summary:
+                extra = ("Authoritative facts from the site's own structured data "
+                         "(schema.org markup — treat as ground truth):\n" + structured_summary)
+            elif key == "faq" and structured_faq:
+                faq_lines = "\n".join(f"Q: {f['question']}\nA: {f['answer']}" for f in structured_faq[:40])
+                extra = ("FAQ pairs published in the site's own schema.org FAQPage markup "
+                         "(authoritative — include them, translated into the target language):\n"
+                         + faq_lines)
             if not chs and not extra:
                 continue
             update_job_progress(job_id, f"Writing section: {section_title(key, lang)}...")
@@ -2433,6 +2525,8 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
             "selection": selection_meta,
             "sections": assembly_meta,
             "contact_candidates": contact_candidates,
+            "structured_facts": structured_facts,
+            "extraction_stats": extraction_stats,
             "analysis_summary": (f"Deep pipeline: discovered ~{discovered_count} URLs, selected "
                                  f"{len(selected)} knowledge pages, extracted {len(chunks)}, "
                                  f"synthesised {len(section_outputs)} sections."),
@@ -2446,6 +2540,7 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
                 "extracted_pages_count": len(chunks),
                 "main_page_screenshot_captured": main_page_screenshot is not None,
                 "website_colors": website_colors,
+                "brand_kit": brand_kit_data,
                 "comprehensive_analysis": comprehensive_analysis,
                 "cost_estimation": cost_estimation,
                 "detected_target_language": lang,
@@ -2465,6 +2560,7 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
                 "extracted_pages_count": len(chunks),
                 "main_page_screenshot_captured": main_page_screenshot is not None,
                 "website_colors": website_colors,
+                "brand_kit": brand_kit_data,
                 "comprehensive_analysis": comprehensive_analysis,
                 "cost_estimation": cost_estimation,
                 "quality_report": quality_report,
@@ -2481,15 +2577,24 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
 @app.route('/api/analyze-company', methods=['POST'])
 @require_api_key
 def start_company_analysis():
-    data = request.get_json()
+    data, err = get_json_body()
+    if err: return err
     url = data.get('url')
     if not url: return jsonify({"error": "Valid 'url' is required"}), 400
-    
+    url_error = validate_public_http_url(url)
+    if url_error: return jsonify({"error": f"Invalid 'url': {url_error}"}), 400
+    try:
+        max_pages = int(data.get('max_pages', 10))
+    except (TypeError, ValueError):
+        return jsonify({"error": "'max_pages' must be an integer"}), 400
+    max_pages = max(1, min(max_pages, MAX_COMPANY_ANALYSIS_PAGES))
+
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {"id": job_id, "job_type": "company_analysis", "status": "pending"}
-    
+    register_job(job_id, {"id": job_id, "job_type": "company_analysis", "status": "pending",
+                          "created_at": time.time()})
+
     thread = threading.Thread(target=run_company_analysis_job, args=(
-        job_id, url, int(data.get('max_pages', 10)), bool(data.get('use_selenium', False))
+        job_id, url, max_pages, bool(data.get('use_selenium', False))
     ))
     thread.start()
     return jsonify({"message": "Company analysis job started.", "job_id": job_id}), 202
@@ -2497,15 +2602,26 @@ def start_company_analysis():
 @app.route('/api/qualify-prospects', methods=['POST'])
 @require_api_key
 def start_prospect_qualification():
-    data = request.get_json()
+    data, err = get_json_body()
+    if err: return err
     if not all(k in data for k in ['user_profile', 'user_personas', 'prospect_urls']):
         return jsonify({"error": "Missing required fields"}), 400
+    prospect_urls = data['prospect_urls']
+    if not isinstance(prospect_urls, list) or not prospect_urls:
+        return jsonify({"error": "'prospect_urls' must be a non-empty list of URLs"}), 400
+    if len(prospect_urls) > MAX_PROSPECT_URLS_PER_JOB:
+        return jsonify({"error": f"'prospect_urls' is limited to {MAX_PROSPECT_URLS_PER_JOB} URLs per job"}), 400
+    for u in prospect_urls:
+        url_error = validate_public_http_url(u)
+        if url_error:
+            return jsonify({"error": f"Invalid prospect URL {u!r}: {url_error}"}), 400
 
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {"id": job_id, "job_type": "prospect_qualification", "status": "pending"}
+    register_job(job_id, {"id": job_id, "job_type": "prospect_qualification", "status": "pending",
+                          "created_at": time.time()})
 
     thread = threading.Thread(target=run_prospect_qualification_job, args=(
-        job_id, data['user_profile'], data['user_personas'], data['prospect_urls']
+        job_id, data['user_profile'], data['user_personas'], prospect_urls
     ))
     thread.start()
     return jsonify({"message": "Prospect qualification job started.", "job_id": job_id}), 202
@@ -2513,15 +2629,23 @@ def start_prospect_qualification():
 @app.route('/api/generate-knowledge-base', methods=['POST'])
 @require_api_key
 def start_knowledge_base_generation():
-    data = request.get_json()
+    data, err = get_json_body()
+    if err: return err
     url = data.get('url')
-    if not url: 
+    if not url:
         return jsonify({"error": "Valid 'url' is required"}), 400
-    
+    url_error = validate_public_http_url(url)
+    if url_error:
+        return jsonify({"error": f"Invalid 'url': {url_error}"}), 400
+
     # Get specific pages if provided
     specific_pages = data.get('specific_pages')
     if specific_pages and not isinstance(specific_pages, list):
         return jsonify({"error": "'specific_pages' must be a list of URLs"}), 400
+    for sp in (specific_pages or []):
+        url_error = validate_public_http_url(sp)
+        if url_error:
+            return jsonify({"error": f"Invalid specific page URL {sp!r}: {url_error}"}), 400
 
     # Optional new params (safe defaults preserve prior behaviour for existing callers).
     depth = str(data.get('depth', 'deep')).lower()
@@ -2532,11 +2656,14 @@ def start_knowledge_base_generation():
     except (TypeError, ValueError):
         target_doc_tokens = TARGET_DOC_TOKENS
     target_doc_tokens = max(2000, min(target_doc_tokens, 120000))
-    max_pages = int(data.get('max_pages', DEFAULT_KB_PAGE_BUDGET))
+    try:
+        max_pages = int(data.get('max_pages', DEFAULT_KB_PAGE_BUDGET))
+    except (TypeError, ValueError):
+        return jsonify({"error": "'max_pages' must be an integer"}), 400
 
     # Validate URL accessibility before starting job
     try:
-        test_response = requests.head(url, timeout=10, allow_redirects=True)
+        test_response = SESSION.head(url, timeout=10, allow_redirects=True)
         if test_response.status_code >= 400:
             return jsonify({
                 "error": f"Website is not accessible. HTTP {test_response.status_code}: {test_response.reason}",
@@ -2559,8 +2686,8 @@ def start_knowledge_base_generation():
         }), 400
     
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {"id": job_id, "job_type": "knowledge_base_generation", "status": "pending",
-                    "created_at": time.time()}
+    register_job(job_id, {"id": job_id, "job_type": "knowledge_base_generation", "status": "pending",
+                          "created_at": time.time()})
 
     thread = threading.Thread(target=run_knowledge_base_job,
                               args=(job_id, url, max_pages, bool(data.get('use_selenium', False)), specific_pages),
@@ -2572,7 +2699,8 @@ def start_knowledge_base_generation():
 @app.route('/api/analyze-html', methods=['POST'])
 @require_api_key
 def analyze_html():
-    data = request.get_json()
+    data, err = get_json_body()
+    if err: return err
     html_content = data.get('html_content')
     if not html_content: return jsonify({"error": "'html_content' is required"}), 400
     
@@ -2597,19 +2725,26 @@ def analyze_html_file():
 @app.route('/api/scrape-page', methods=['POST'])
 @require_api_key
 def scrape_page():
-    data = request.get_json()
+    data, err = get_json_body()
+    if err: return err
     url = data.get('url')
     if not url:
         return jsonify({"error": "'url' is required"}), 400
+    url_error = validate_public_http_url(url)
+    if url_error:
+        return jsonify({"error": f"Invalid 'url': {url_error}"}), 400
 
     use_selenium = bool(data.get('use_selenium', False))
     include_screenshot = bool(data.get('include_screenshot', False))
+    include_brand_kit = bool(data.get('include_brand_kit', False))
 
     if not openai_client:
         return jsonify({"error": "OpenAI client is not configured"}), 500
 
     try:
-        result = scrape_single_page(url, use_selenium=use_selenium, include_screenshot=include_screenshot)
+        result = scrape_single_page(url, use_selenium=use_selenium,
+                                    include_screenshot=include_screenshot,
+                                    include_brand_kit=include_brand_kit)
         return jsonify(result), 200
     except (ConnectionError, ValueError) as e:
         return jsonify({"error": "URL is not accessible", "details": str(e)}), 400

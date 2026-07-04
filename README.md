@@ -13,20 +13,24 @@
 
 ### 🎯 Key Features
 
-- **🔍 Deep, scalable discovery + smart selection**: Sitemap → crawl → **deterministic pre-filter** (drops product/cart/checkout/admin/asset/faceted URLs for free) → AI selection of the most knowledge-rich pages, bounded by a page budget. Handles 1000+ page sites without sending the catalogue to an LLM. (Set `depth: "core"` for the legacy hardcoded-core-page behaviour.)
+- **🔍 Deep, scalable discovery + smart selection**: Sitemap (with `<lastmod>`/`<priority>` ranking) → crawl → **deterministic pre-filter** (drops product/cart/checkout/admin/asset/faceted URLs for free) → **keyword auto-selection** of obvious knowledge pages → AI selection only for the ambiguous remainder, bounded by a page budget. Handles 1000+ page sites without sending the catalogue to an LLM. (Set `depth: "core"` for the legacy hardcoded-core-page behaviour.)
+- **🏷️ Structured-data harvest (schema.org / JSON-LD / Open Graph)**: Before any LLM call, every fetched page is parsed for `Organization`, `FAQPage`, `Product` and Open Graph markup — free, authoritative company facts (name, logo, address, phones, socials, opening hours, FAQ pairs) that are fed into the knowledge base as ground truth instead of hoping the model extracts them from prose.
+- **🎨 Deterministic brand kit** (logo · color palette · fonts · socials): The site is **measured, not guessed** — logo from schema.org/apple-touch-icon/header `<img>` heuristics (downloaded and magic-byte-validated), color palette from the site's own CSS variables + `theme-color` + screenshot pixel quantization (Pillow), fonts from CSS/Google-Fonts declarations, social links from JSON-LD `sameAs` and footer anchors. Saved to `reports/` and returned in the job result.
 - **🧹 Clean-text extraction**: Converts HTML → clean markdown with **trafilatura** (readability/BeautifulSoup fallbacks) before the model — ~5–10× fewer input tokens and much higher signal than raw HTML.
 - **🧩 Per-section map-reduce synthesis**: Each page is classified into a canonical section; sections are synthesised **independently** (with map-reduce for large ones), removing the old single ≤16K-token compile bottleneck so the document stays complete.
-- **🎚️ Tiered models**: Cheap model for bulk extraction/classification, an optional stronger model for synthesis via `OPENAI_MODEL_STRONG` (defaults to the cheap model — no cost change until you opt in). Per-model cost breakdown in `cost_estimation.by_model`.
+- **⚡ Extraction cache**: Per-page extractions are cached on disk keyed by `(url, language, content-hash)`, so re-running a site (or iterating during development) re-pays OpenAI **only for pages whose content actually changed**. TTL configurable via `EXTRACTION_CACHE_TTL_SECONDS`.
+- **🤖 Automatic Selenium fallback**: A page whose HTML is large but whose clean text is tiny looks JS-rendered; it is transparently re-fetched once through headless Chrome (bounded per job), so SPA sites work without the caller guessing `use_selenium` upfront.
+- **🎚️ Tiered models**: Cheap model for bulk extraction/classification, an optional stronger model for synthesis via `OPENAI_MODEL_STRONG` (defaults to the cheap model — no cost change until you opt in). Per-model cost breakdown in `cost_estimation.by_model` — **every** OpenAI call is now tracked.
 - **⚡ Parallel extraction**: Pages are fetched + extracted concurrently (thread pool) for speed and resilience — one slow/failed page no longer kills the whole job.
-- **✅ Completeness audit + contact safety-net**: A `quality_report` flags missing contact/policy/FAQ; a regex pass harvests emails/phone numbers so contact details aren't missed.
-- **⚡ Synchronous Single-Page Scrape**: `/api/scrape-page` returns results immediately without a job queue.
-- **📸 Visual Context Integration**: Captures full-page screenshots for enhanced AI understanding.
+- **✅ Completeness audit + contact safety-net**: A `quality_report` flags missing contact/policy/FAQ; a regex pass plus the structured-data harvest gathers emails/phone numbers so contact details aren't missed.
+- **⚡ Synchronous Single-Page Scrape**: `/api/scrape-page` returns results immediately (structured data included; brand kit optional) without a job queue.
+- **📸 Visual Context Integration**: Captures full-page screenshots for enhanced AI understanding and palette measurement.
 - **🌐 Source-language output**: The knowledge base is written in the **website's own language**, so a Farsi site yields a Farsi KB (headings, table of contents and body) that matches the chatbot's language. Detection is deterministic script-based for Persian/Arabic (immune to slow/head-heavy pages) with an LLM fallback, run on clean visible text rather than raw HTML.
-- **📊 Comprehensive Reporting**: Markdown KB + JSON metadata (discovery/selection/section stats, quality report, per-model cost).
-- **🔐 Secure API**: API key authentication for all endpoints.
-- **🎨 Website Color Analysis**: Extracts website brand colors and design elements.
+- **🔐 Secure by default**: API-key auth (constant-time comparison) on all endpoints, an **SSRF guard** that refuses to fetch loopback/private/link-local/cloud-metadata addresses, request-body size limits, and input validation/clamping on every parameter.
+- **🤝 Polite crawling**: Shared connection-pooled HTTP session with automatic retries, `robots.txt` `Disallow` respected, and a per-request crawl delay.
+- **📊 Comprehensive Reporting**: Markdown KB + JSON metadata (discovery/selection/section stats, structured facts, brand kit, quality report, per-model cost, cache stats).
 - **📈 Cost Tracking**: Real-time cost estimation and token usage monitoring.
-- **🧪 Comprehensive Testing Suite**: Automated testing framework for multiple websites.
+- **🧪 Tests**: A pytest unit suite for the pure helpers (`tests/`) plus the end-to-end batch harness (`test_cases/`).
 
 ### 🎯 Use Cases
 
@@ -41,20 +45,21 @@
 
 ## 🛠️ Technology Stack
 
-- **Backend**: Python 3.7+, Flask
+- **Backend**: Python 3.10+, Flask (`str | None` type hints require 3.10+)
 - **AI Processing**: OpenAI GPT-5 family (tiered: cheap model for extraction, optional strong model for synthesis)
-- **Web Crawling**: Requests, Selenium WebDriver
+- **Web Crawling**: Requests (pooled session + retries), Selenium WebDriver, `urllib.robotparser`
 - **Content Processing**: trafilatura + readability-lxml (clean main-content extraction), BeautifulSoup4, Pillow (PIL)
-- **Data Storage**: JSON reports, Markdown knowledge bases
-- **Authentication**: API key-based security
-- **PDF Generation**: ReportLab with Persian font support
+- **Structured data**: schema.org / JSON-LD, Open Graph, meta-tag harvesting (`structured_data.py`)
+- **Brand extraction**: CSS + screenshot pixel quantization, logo download/validation (`brand_kit.py`)
+- **Data Storage**: JSON reports, Markdown knowledge bases, on-disk extraction cache
+- **Security**: constant-time API-key auth, SSRF guard (`ipaddress`), request-size limits
+- **PDF Generation**: ReportLab with Persian font support (test harness)
 - **Text Processing**: Arabic Reshaper, BiDi algorithm for RTL text
-- **Testing Framework**: Comprehensive automated testing suite
-- **Data Export**: CSV reports with detailed metrics
+- **Testing**: pytest unit suite (`tests/`) + end-to-end batch harness (`test_cases/`)
 
 ## 📋 Prerequisites
 
-- Python 3.7 or higher
+- Python 3.10 or higher
 - OpenAI API key
 - Chrome browser (for screenshot functionality)
 - Git (for version control)
@@ -103,6 +108,11 @@ OPENAI_API_KEY=sk-your_openai_api_key_here
 # model, so cost is unchanged until you opt in by setting OPENAI_MODEL_STRONG.
 # OPENAI_MODEL_CHEAP=gpt-5-nano
 # OPENAI_MODEL_STRONG=gpt-5-mini
+
+# --- Extraction cache (optional) ---
+# Per-page extractions are cached in cache/extractions/ keyed by (url, language, content-hash).
+# Default TTL is 7 days. Set to 0 to disable the cache entirely.
+# EXTRACTION_CACHE_TTL_SECONDS=604800
 ```
 
 ### 3. Run the Service
@@ -113,7 +123,18 @@ OPENAI_API_KEY=sk-your_openai_api_key_here
 
 The API will be available at `http://localhost:5000`
 
-### 4. Run Comprehensive Tests
+### 4. Run Unit Tests
+
+Fast, offline unit tests for the pure helpers (URL safety, pre-filter, language detection, structured-data parsing, brand-kit color/logo logic, extraction cache):
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests/ -q
+```
+
+These make **no** network or OpenAI calls, so they're safe to run anytime.
+
+### 5. Run Comprehensive Tests
 
 Test all websites with a single command:
 
@@ -158,9 +179,10 @@ Scrape and extract structured knowledge from a single URL immediately. Returns t
 ```
 
 **Parameters:**
-- `url` (required): The page URL to scrape
+- `url` (required): The page URL to scrape (validated against the SSRF guard)
 - `use_selenium` (optional): Use Selenium for JavaScript-rendered pages (default: `false`)
 - `include_screenshot` (optional): Capture a full-page screenshot for visual context (default: `false`)
+- `include_brand_kit` (optional): Also extract the deterministic brand kit (logo, palette, fonts, socials) (default: `false`)
 
 **Response (200):**
 ```json
@@ -170,11 +192,17 @@ Scrape and extract structured knowledge from a single URL immediately. Returns t
   "title": "About Us",
   "detected_language": "en",
   "extracted_content": "# About Us\n\n...",
+  "structured_data": {
+    "organization": { "name": "Example Inc", "phones": ["+1 555 0100"] },
+    "socials": ["https://instagram.com/example"],
+    "faq": [{ "question": "...", "answer": "..." }]
+  },
   "screenshot_captured": false,
   "cost_estimation": {
     "total_cost_usd": "0.000826",
     "prompt_tokens": 4200,
-    "completion_tokens": 800
+    "completion_tokens": 800,
+    "by_model": { "gpt-5-nano": { "cost_usd": 0.000826 } }
   }
 }
 ```
@@ -205,7 +233,7 @@ Generate a comprehensive knowledge base from a website.
 - `specific_pages` (optional): Array of exact page URLs to process (overrides discovery).
 - `use_selenium` (optional): Enable screenshot capture and a JS-rendering crawl fallback.
 
-**How the deep pipeline works:** discover URLs → deterministic pre-filter → AI page selection (within `max_pages`) → parallel clean-text extraction on the cheap model (each page classified into a canonical section) → per-section map-reduce synthesis on the strong model (no global token cap) → assembly into one document → completeness audit. The response keeps the same shape as before, plus a `quality_report` and a richer `comprehensive_analysis` (discovery/selection/section metadata) and per-model cost breakdown in `cost_estimation.by_model`.
+**How the deep pipeline works:** discover URLs (sitemap `lastmod`/`priority`-ranked) → deterministic pre-filter → keyword auto-selection + AI selection for the remainder (within `max_pages`) → parallel clean-text extraction on the cheap model, with a free schema.org/Open Graph harvest and cache lookup per page (each page classified into a canonical section) → per-section map-reduce synthesis on the strong model, seeded with the harvested structured facts (no global token cap) → assembly into one document → completeness audit. The response keeps the same shape as before, plus `brand_kit`, and a richer `comprehensive_analysis` that now includes `structured_facts`, `selection` (with `auto_selected_by_keyword` / `llm_selection_skipped`) and `extraction_stats` (cache hits, Selenium fallbacks), a `quality_report`, and the per-model cost breakdown in `cost_estimation.by_model`.
 
 #### 3. Check Job Status
 
@@ -290,6 +318,13 @@ reports/
 - Bi-lingual progress messages (English/Persian)
 - Content translation and localization
 - Persian URL pattern recognition
+
+## 🔐 Security
+
+- **Authentication**: every endpoint (except `/api/health`) requires the `api-key` header, compared in constant time.
+- **SSRF protection**: all caller-supplied URLs (`generate-knowledge-base`, `scrape-page`, `analyze-company`, `qualify-prospects`, and every `specific_pages` entry) are validated before any fetch. Requests that resolve to loopback, private (RFC1918), link-local, cloud-metadata (`169.254.169.254`), or other non-public addresses are refused, as are non-`http(s)` schemes.
+- **Resource limits**: request bodies are capped (`MAX_CONTENT_LENGTH`), `max_pages`/`prospect_urls` are validated and clamped, and finished jobs are evicted from memory (TTL + count cap) so a long-running server doesn't grow unbounded.
+- **Deployment note**: `python grand_spider.py` runs Flask's development server. For production, run behind a WSGI server (gunicorn/uWSGI) and a reverse proxy.
 
 ## 🚨 Important Considerations
 

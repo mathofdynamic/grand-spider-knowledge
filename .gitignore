@@ -14,6 +14,7 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.pytest_cache/
 
 # Logs & temp
 *.log
@@ -23,3 +24,4 @@ _cmp_*
 
 # Generated outputs
 reports/
+cache/

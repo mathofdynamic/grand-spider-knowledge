@@ -12,5 +12,5 @@ lxml>=4.9.0
 # For Selenium (optional, uncomment if needed)
 selenium>=4.15.0
 webdriver-manager>=4.0.0
-# For screenshot functionality
+# For screenshot functionality + deterministic logo/color (brand kit) extraction
 Pillow>=10.0.0
