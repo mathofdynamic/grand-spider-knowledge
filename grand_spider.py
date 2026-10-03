@@ -80,28 +80,29 @@ logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(threadName)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- API Keys & OpenAI Client ---
+# --- API Keys & Vercel AI Gateway Client ---
 EXPECTED_SERVICE_API_KEY = os.getenv("SERVICE_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+VERCEL_API_KEY = os.getenv("VERCEL_API_KEY")
 
 if not EXPECTED_SERVICE_API_KEY:
     logger.error("FATAL: SERVICE_API_KEY environment variable not set.")
-if not OPENAI_API_KEY:
-    logger.error("FATAL: OPENAI_API_KEY environment variable not set.")
+if not VERCEL_API_KEY:
+    logger.error("FATAL: VERCEL_API_KEY environment variable not set.")
 
 try:
-    if OPENAI_API_KEY:
+    if VERCEL_API_KEY:
         openai_client = OpenAI(
-            api_key=OPENAI_API_KEY,
+            api_key=VERCEL_API_KEY,
+            base_url="https://ai-gateway.vercel.sh/v1",
             timeout=120.0,
             max_retries=3
         )
-        logger.info("OpenAI client initialized successfully.")
+        logger.info("Vercel AI Gateway client initialized successfully.")
     else:
         openai_client = None
-        logger.error("OpenAI client could not be initialized: OPENAI_API_KEY is missing.")
+        logger.error("Vercel AI Gateway client could not be initialized: VERCEL_API_KEY is missing.")
 except Exception as e:
-    logger.error(f"Failed to initialize OpenAI client: {e}")
+    logger.error(f"Failed to initialize Vercel AI Gateway client: {e}")
     openai_client = None
 
 # --- Constants ---
@@ -115,9 +116,8 @@ MAX_CONTENT_LENGTH = 15000 # For simple text extraction
 # --- Tiered model strategy ---
 # Cheap model: bulk classification, per-page extraction, completeness checks.
 # Strong model: final per-section synthesis & assembly where quality matters most.
-# Defaults keep BOTH on the cheap model, so cost/behaviour are identical to before until
-# you opt in by setting OPENAI_MODEL_STRONG in the environment.
-OPENAI_MODEL_CHEAP = os.getenv("OPENAI_MODEL_CHEAP", os.getenv("OPENAI_MODEL", "gpt-5-nano"))
+# Defaults keep BOTH on GPT-6 Luna. Model IDs use Vercel AI Gateway's provider/model format.
+OPENAI_MODEL_CHEAP = os.getenv("OPENAI_MODEL_CHEAP", os.getenv("OPENAI_MODEL", "openai/gpt-6-luna"))
 OPENAI_MODEL_STRONG = os.getenv("OPENAI_MODEL_STRONG", OPENAI_MODEL_CHEAP)
 # Backward-compatible alias used by existing (company analysis / prospecting) helpers.
 OPENAI_MODEL = OPENAI_MODEL_CHEAP
@@ -356,6 +356,7 @@ PRICE_PER_CACHED_INPUT_TOKEN_MILLION = 0.005
 # Unknown models fall back to DEFAULT_MODEL_PRICING (nano rates).
 DEFAULT_MODEL_PRICING = {"input": PRICE_PER_INPUT_TOKEN_MILLION, "output": PRICE_PER_OUTPUT_TOKEN_MILLION}
 MODEL_PRICING = {
+    "openai/gpt-6-luna": {"input": 0.10, "output": 0.50},
     "gpt-5-nano": {"input": 0.05, "output": 0.40},
     "gpt-5-mini": {"input": 0.25, "output": 2.00},
     "gpt-5": {"input": 1.25, "output": 10.00},
@@ -436,13 +437,13 @@ class CostAccumulator:
 
 def llm_chat(messages, model=None, max_tokens=2000, json_mode=False,
              cost: "CostAccumulator" = None, input_text_for_count=None):
-    """Single OpenAI chat call used by the overhauled KB pipeline.
+    """Single Vercel AI Gateway chat call used by the overhauled KB pipeline.
 
     Returns (content_str, prompt_tokens, completion_tokens) and records usage into
     `cost` when provided. Uses the API-reported token usage when available.
     """
     if not openai_client:
-        raise ConnectionError("OpenAI client not initialized.")
+        raise ConnectionError("Vercel AI Gateway client not initialized.")
     model = model or OPENAI_MODEL_CHEAP
     kwargs = {"model": model, "messages": messages, "max_completion_tokens": max_tokens}
     if json_mode:
@@ -1269,7 +1270,7 @@ def detect_language_deterministic(text: str, threshold: float = 0.15):
 def _llm_detect_language(text: str, url: str) -> tuple[str, int, int]:
     """LLM language identification from clean visible text. Returns (code, p, c)."""
     if not openai_client:
-        raise ConnectionError("OpenAI client not initialized.")
+        raise ConnectionError("Vercel AI Gateway client not initialized.")
     if not text or not text.strip():
         return DEFAULT_TARGET_LANGUAGE, 0, 0
     messages = [
@@ -1294,7 +1295,7 @@ def detect_language_from_html_with_openai(html_snippet: str, url: str) -> tuple[
     Signature-compatible with the previous version (used by /api/scrape-page). The key fix:
     detect from extracted visible text, not raw HTML head/markup which skews toward English.
     """
-    if not openai_client: raise ConnectionError("OpenAI client not initialized.")
+    if not openai_client: raise ConnectionError("Vercel AI Gateway client not initialized.")
     if not html_snippet or not html_snippet.strip():
         return DEFAULT_TARGET_LANGUAGE, 0, 0
     clean = clean_text_from_html(html_snippet, url) or html_snippet
@@ -1344,7 +1345,7 @@ def detect_site_language(main_page_html: str, base_url: str, candidate_pages: li
 
 def identify_knowledge_rich_content_clusters(page_details: list[dict], root_url: str, lang: str) -> tuple[dict, int, int]:
     """Identify and prioritize knowledge-rich content clusters for chatbot training."""
-    if not openai_client: raise ConnectionError("OpenAI client not initialized.")
+    if not openai_client: raise ConnectionError("Vercel AI Gateway client not initialized.")
     
     # Prepare URL list for analysis - limit for better processing
     urls_list = [p['url'] for p in page_details]
@@ -1510,7 +1511,7 @@ Output this JSON schema:
 def extract_website_colors_with_openai(html_content: str, url: str, screenshot_base64: str = None) -> tuple[dict, int, int]:
     """Extract website background color and primary brand color using AI analysis."""
     if not openai_client: 
-        raise ConnectionError("OpenAI client not initialized.")
+        raise ConnectionError("Vercel AI Gateway client not initialized.")
     
     # Include screenshot context if available
     screenshot_context = ""
@@ -1564,7 +1565,7 @@ def extract_knowledge_from_page_with_openai(html_content: str, url: str, title: 
     Returns (data, prompt_tokens, completion_tokens) where data has keys:
     url, title_suggestion, primary_category, extracted_chunk.
     """
-    if not openai_client: raise ConnectionError("OpenAI client not initialized.")
+    if not openai_client: raise ConnectionError("Vercel AI Gateway client not initialized.")
 
     clean_text = clean_text_from_html(html_content, url)
     section_keys_str = ", ".join(KB_SECTION_KEYS)
@@ -2739,7 +2740,7 @@ def scrape_page():
     include_brand_kit = bool(data.get('include_brand_kit', False))
 
     if not openai_client:
-        return jsonify({"error": "OpenAI client is not configured"}), 500
+        return jsonify({"error": "Vercel AI Gateway client is not configured"}), 500
 
     try:
         result = scrape_single_page(url, use_selenium=use_selenium,
