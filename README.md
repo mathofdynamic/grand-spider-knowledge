@@ -227,13 +227,17 @@ Generate a comprehensive knowledge base from a website.
 
 **Parameters:**
 - `url` (required): Base URL of the website
-- `depth` (optional, default `deep`): `deep` discovers the whole site (sitemap + crawl), deterministically drops product/cart/asset URLs, and uses AI to select the most knowledge-rich pages — scales to 1000+ page sites. `core` uses only the legacy hardcoded core-page patterns (about/contact/faq/...).
-- `max_pages` (optional, default 25): Page budget — how many knowledge pages to deeply extract (capped at 80).
+- `depth` (optional, default `deep`): `deep` discovers the whole site (sitemap + crawl), deterministically drops product/cart/asset URLs, then selects pages by stable path score and URL order — scales to 1000+ page sites. `core` uses only the legacy hardcoded core-page patterns (about/contact/faq/...).
+- `max_pages` (optional, default 25): Page budget — how many knowledge pages to deeply extract. The service clamps this to 1–80 pages; 80 is the hard maximum.
 - `target_doc_tokens` (optional, default 18000): Soft size budget for the final single document; lowest-priority sections are compressed first if exceeded.
-- `specific_pages` (optional): Array of exact page URLs to process (overrides discovery).
+- `specific_pages` (optional): Non-empty array of exact page URLs to process (overrides discovery). If provided, a non-array value or an empty array returns HTTP 400.
 - `use_selenium` (optional): Enable screenshot capture and a JS-rendering crawl fallback.
+- `previous_fingerprint` (optional): SHA-256 `source_fingerprint` from the previous completed crawl. If all selected source pages still match, the job completes with `unchanged: true`, returns page text/fingerprints, and omits `final_knowledge_base` without making model calls. `source_fingerprint` is accepted as an alias.
+- `callback_url` (optional): Public HTTP(S) URL to receive a compact JSON completion event when the job completes or fails. The event includes `job_id`, `status`, `source_fingerprint`, `unchanged`, `error_code`, and `finished_at`; fetch the full result from `GET /api/jobs/{job_id}`. Delivery can repeat if the endpoint accepts the event but its response is lost, so use `job_id` as an idempotency key.
 
-**How the deep pipeline works:** discover URLs (sitemap `lastmod`/`priority`-ranked) → deterministic pre-filter → keyword auto-selection + AI selection for the remainder (within `max_pages`) → parallel clean-text extraction on the cheap model, with a free schema.org/Open Graph harvest and cache lookup per page (each page classified into a canonical section) → per-section map-reduce synthesis on the strong model, seeded with the harvested structured facts (no global token cap) → assembly into one document → completeness audit. The response keeps the same shape as before, plus `brand_kit`, and a richer `comprehensive_analysis` that now includes `structured_facts`, `selection` (with `auto_selected_by_keyword` / `llm_selection_skipped`) and `extraction_stats` (cache hits, Selenium fallbacks), a `quality_report`, and the per-model cost breakdown in `cost_estimation.by_model`.
+The current hard limit is **80 selected pages per job**. Page selection is deterministic for the discovered URL set and does not change when sitemap priority or `lastmod` metadata changes. Discovery retains at most 5,000 candidate URLs for selection; sitemap parsing may enumerate more before that cap is applied. Fetching and page extraction use up to six workers, and each requested page is checked against `robots.txt` before its content is fetched. Page fetch/extraction work grows roughly with the selected page count, while section synthesis and audits add content-dependent model work. A phase-4 caller reported about 25 seconds and $0.0006–$0.0008 for one page, and about 8 minutes / $0.032 for 30 pages. Those are observed runs, not a latency or price guarantee; model, site response, content length, caching, and synthesis affect actual totals.
+
+**How the deep pipeline works:** discover URLs from sitemaps or a crawl → deterministic pre-filter and stable page selection (within `max_pages`) → fetch and fingerprint cleaned source text → parallel per-page extraction on the cheap model, with a free schema.org/Open Graph harvest and cache lookup per page (each page classified into a canonical section) → per-section map-reduce synthesis on the strong model, seeded with the harvested structured facts (no global token cap) → assembly into one document → completeness audit. The response keeps the same shape as before, plus `brand_kit`, and a richer `comprehensive_analysis` that now includes `structured_facts`, deterministic `selection` metadata, `extraction_stats` (cache hits, Selenium fallbacks), a `quality_report`, and the per-model cost breakdown in `cost_estimation.by_model`.
 
 #### 3. Check Job Status
 
@@ -258,6 +262,32 @@ Monitor job progress and retrieve results.
   }
 }
 ```
+
+#### Fingerprints and page text
+
+On a changed successful job, `GET /api/jobs/{job_id}` includes:
+
+```json
+{
+  "status": "completed",
+  "unchanged": false,
+  "source_fingerprint": "<sha256>",
+  "page_fingerprints": { "https://example.com/about": "<sha256>" },
+  "pages": [
+    {
+      "url": "https://example.com/about",
+      "title": "About us",
+      "fingerprint": "<sha256>",
+      "text": "Cleaned source text before model processing..."
+    }
+  ],
+  "final_knowledge_base": "# ..."
+}
+```
+
+`source_fingerprint` hashes the selected page URLs and their individual fingerprints. Each page fingerprint covers its fetched title and cleaned text. Send the aggregate value as `previous_fingerprint` on the next crawl. When unchanged, the job response keeps `pages`, `page_fingerprints`, and `source_fingerprint`, sets `unchanged: true`, and has no `final_knowledge_base`. For `max_pages: 1`, `single_page_text` contains the page's cleaned text directly, without a generated introduction or table of contents.
+
+Failures use `status: "failed"`, a human-readable `error`, and one stable `error_code`: `site_unreachable`, `blocked`, `timed_out`, or `no_readable_content`. The synchronous URL preflight uses the same `error_code` values in its 400 response. If a site rejects `HEAD` with 405 or 501, preflight probes it with `GET` before deciding it is unavailable.
 
 #### 4. Health Check
 
@@ -451,4 +481,4 @@ For support, questions, or feature requests:
 
 ---
 
-**Grand Spider** - Transforming websites into intelligent knowledge bases for the AI era. 
+**Grand Spider** - Transforming websites into intelligent knowledge bases for the AI era.

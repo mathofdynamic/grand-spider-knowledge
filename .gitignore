@@ -21,6 +21,7 @@ venv/
 _tmp*
 _cmp/
 _cmp_*
+.perfection/
 
 # Generated outputs
 reports/

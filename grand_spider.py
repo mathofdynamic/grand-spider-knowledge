@@ -1,4 +1,5 @@
 import os
+import contextvars
 import hashlib
 import hmac
 import ipaddress
@@ -22,7 +23,10 @@ from dotenv import load_dotenv
 from urllib.parse import urlparse, urljoin, unquote
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
+from requests.utils import select_proxy
 from urllib3.util.retry import Retry
+import urllib3.connection as urllib3_connection
+import urllib3.connectionpool as urllib3_connectionpool
 import tiktoken
 
 from structured_data import (extract_structured_data, merge_structured_facts,
@@ -197,8 +201,96 @@ SELENIUM_FALLBACK_MIN_HTML = 20000     # ...but only when the raw HTML is substa
 SELENIUM_FALLBACK_MAX_PAGES = 5        # per-job cap on automatic Selenium re-fetches
 
 # Shared HTTP session: connection pooling + retry-with-backoff on transient failures.
+_pinned_public_ip = contextvars.ContextVar("grand_spider_pinned_public_ip", default=None)
+
+
+class _PinnedAddressConnectionMixin:
+    """Keep the URL hostname for Host/SNI while connecting to a checked IP."""
+
+    def __init__(self, *args, pinned_ip=None, **kwargs):
+        if not pinned_ip:
+            raise ValueError("A pinned public IP is required")
+        super().__init__(*args, **kwargs)
+        self._pinned_ip = pinned_ip
+
+    def _new_conn(self):
+        # urllib3 uses _dns_host for socket creation and also as the public host
+        # property. Swap it only while the socket is opened so TLS SNI and Host
+        # headers continue to use the original URL hostname.
+        original_dns_host = self._dns_host
+        self._dns_host = self._pinned_ip
+        try:
+            return super()._new_conn()
+        finally:
+            self._dns_host = original_dns_host
+
+
+class _PinnedHTTPConnection(_PinnedAddressConnectionMixin, urllib3_connection.HTTPConnection):
+    pass
+
+
+class _PinnedHTTPSConnection(_PinnedAddressConnectionMixin, urllib3_connection.HTTPSConnection):
+    pass
+
+
+class _PinnedHTTPConnectionPool(urllib3_connectionpool.HTTPConnectionPool):
+    ConnectionCls = _PinnedHTTPConnection
+
+
+class _PinnedHTTPSConnectionPool(urllib3_connectionpool.HTTPSConnectionPool):
+    ConnectionCls = _PinnedHTTPSConnection
+
+
+class _PublicIpPinningHTTPAdapter(HTTPAdapter):
+    """Use the shared session while pinning explicitly guarded callback requests."""
+
+    @staticmethod
+    def _pinned_pool(url, pinned_ip, pool_kwargs=None):
+        parsed = urlparse(url)
+        pool_class = {
+            "http": _PinnedHTTPConnectionPool,
+            "https": _PinnedHTTPSConnectionPool,
+        }.get(parsed.scheme)
+        if pool_class is None or not parsed.hostname:
+            raise requests.exceptions.InvalidURL("Pinned requests require an HTTP(S) URL")
+        return pool_class(
+            host=parsed.hostname,
+            port=parsed.port,
+            pinned_ip=pinned_ip,
+            maxsize=1,
+            block=True,
+            **(pool_kwargs or {}),
+        )
+
+    def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
+        pinned_ip = _pinned_public_ip.get()
+        if not pinned_ip:
+            parent_method = getattr(super(), "get_connection_with_tls_context", None)
+            if parent_method:
+                return parent_method(request, verify, proxies, cert)
+            return super().get_connection(request.url, proxies)
+
+        if select_proxy(request.url, proxies):
+            raise requests.exceptions.RequestException(
+                "Pinned public callbacks cannot be sent through an HTTP proxy"
+            )
+        host_params, pool_kwargs = self.build_connection_pool_key_attributes(request, verify, cert)
+        return self._pinned_pool(request.url, pinned_ip, pool_kwargs)
+
+    def get_connection(self, url, proxies=None):
+        # Requests < 2.32 calls this older hook from HTTPAdapter.send.
+        pinned_ip = _pinned_public_ip.get()
+        if not pinned_ip:
+            return super().get_connection(url, proxies)
+        if select_proxy(url, proxies):
+            raise requests.exceptions.RequestException(
+                "Pinned public callbacks cannot be sent through an HTTP proxy"
+            )
+        return self._pinned_pool(url, pinned_ip)
+
+
 SESSION = requests.Session()
-_http_adapter = HTTPAdapter(
+_http_adapter = _PublicIpPinningHTTPAdapter(
     max_retries=Retry(total=2, backoff_factor=0.5, status_forcelist=(500, 502, 503, 504),
                       allowed_methods=frozenset(['GET', 'HEAD'])),
     pool_connections=20, pool_maxsize=20,
@@ -235,7 +327,7 @@ REPORTS_DIR = "reports"
 
 # --- Per-page extraction cache ---
 # Re-running a site does not re-pay OpenAI for pages whose content hasn't changed:
-# the cache key is (url, target language, hash of the page's clean text).
+# the cache key is (url, target language, hash of the fetched title and clean text).
 EXTRACTION_CACHE_DIR = os.path.join("cache", "extractions")
 EXTRACTION_CACHE_TTL_SECONDS = int(os.getenv("EXTRACTION_CACHE_TTL_SECONDS", 7 * 24 * 3600))
 
@@ -297,6 +389,9 @@ PROGRESS_MESSAGES_FA = {
     "Discovering core website pages...": "کشف صفحات اصلی وب‌سایت...",
     "Extracting knowledge from core pages...": "استخراج دانش از صفحات اصلی...",
     # Overhauled deep pipeline
+    "Reading source pages...": "\u062f\u0631 \u062d\u0627\u0644 \u062e\u0648\u0627\u0646\u062f\u0646 \u0635\u0641\u062d\u0627\u062a \u0645\u0646\u0628\u0639...",
+    "Reading source page": "\u062f\u0631 \u062d\u0627\u0644 \u062e\u0648\u0627\u0646\u062f\u0646 \u0635\u0641\u062d\u0647 \u0645\u0646\u0628\u0639...",
+    "Source pages are unchanged; skipping model processing.": "\u0635\u0641\u062d\u0627\u062a \u0645\u0646\u0628\u0639 \u062a\u063a\u06cc\u06cc\u0631 \u0646\u06a9\u0631\u062f\u0647\u200c\u0627\u0646\u062f\u061b \u067e\u0631\u062f\u0627\u0632\u0634 \u0645\u062f\u0644 \u0631\u062f \u0634\u062f.",
     "Fetching homepage...": "دریافت صفحه اصلی...",
     "Extracting knowledge from pages...": "استخراج دانش از صفحات...",
     "Extracting knowledge": "استخراج دانش از صفحات...",
@@ -335,6 +430,28 @@ def update_job_progress(job_id: str, progress_message: str):
     with jobs_lock:
         jobs[job_id]["progress"] = progress_message
         jobs[job_id]["progress_fa"] = get_progress_fa(progress_message)
+
+
+def notify_job_callback(job_id: str):
+    """Send a compact completion event; callback failures never change the job result."""
+    with jobs_lock:
+        job = dict(jobs.get(job_id) or {})
+    callback_url = job.get("callback_url")
+    if not callback_url:
+        return
+
+    payload = {
+        "job_id": job_id,
+        "status": job.get("status"),
+        "source_fingerprint": job.get("source_fingerprint"),
+        "unchanged": bool(job.get("unchanged", False)),
+        "error_code": job.get("error_code"),
+        "finished_at": job.get("finished_at"),
+    }
+    try:
+        post_callback_event(callback_url, payload)
+    except Exception as error:
+        logger.warning(f"Completion callback failed for job {job_id}: {error}")
 
 # --- Tokenizer and Pricing ---
 try:
@@ -487,37 +604,21 @@ def discover_core_pages_only(base_url: str, specific_pages: list = None) -> list
     """
     discovered_pages = []
     
-    # If specific pages are provided, use them directly
+    # If specific pages are provided, use only those URLs directly.
     if specific_pages:
         logger.info(f"Using provided specific pages: {len(specific_pages)} pages")
-        for page_url in specific_pages:
-            try:
-                # Validate the URL is accessible
-                response = SESSION.head(page_url, timeout=10, allow_redirects=True)
-                if response.status_code < 400:
-                    discovered_pages.append({
-                        'url': page_url,
-                        'title': 'N/A',
-                        'type': 'specified_core_page'
-                    })
-                    logger.info(f"✓ Core page accessible: {page_url}")
-                else:
-                    logger.warning(f"✗ Core page not accessible (HTTP {response.status_code}): {page_url}")
-            except requests.exceptions.RequestException as e:
-                logger.warning(f"✗ Core page not accessible (Error): {page_url} - {e}")
-        
-        # Always include the main page
-        if base_url not in [p['url'] for p in discovered_pages]:
-            discovered_pages.insert(0, {
-                'url': base_url,
-                'title': 'Main Page',
-                'type': 'main_page'
+        for page_url in sorted(set(specific_pages)):
+            discovered_pages.append({
+                'url': page_url,
+                'title': 'N/A',
+                'type': 'specified_core_page'
             })
         
         return discovered_pages
     
     # If no specific pages provided, try to discover core pages automatically
     logger.info(f"Auto-discovering core pages for {base_url}")
+    robots = get_robots_parser(base_url)
     
     # Always start with the main page
     discovered_pages.append({
@@ -546,6 +647,8 @@ def discover_core_pages_only(base_url: str, specific_pages: list = None) -> list
     
     for pattern in core_patterns:
         test_url = base_path + pattern
+        if not robots_allows(robots, test_url):
+            continue
         try:
             response = SESSION.head(test_url, timeout=5, allow_redirects=True)
             if response.status_code < 400:
@@ -616,38 +719,91 @@ def get_json_body():
 
 
 # --- URL Safety (SSRF guard) ---
-def validate_public_http_url(url) -> str | None:
-    """Reject URLs that are not public http(s) targets (SSRF guard).
+def resolve_public_http_url(url) -> tuple[list[str] | None, str | None]:
+    """Resolve a public HTTP(S) URL and return its checked address list.
 
-    Returns an error message when the URL is unsafe/invalid, else None. Every IP the
-    hostname resolves to must be public: loopback, private (RFC1918), link-local
-    (incl. the 169.254.169.254 cloud metadata endpoint), reserved and multicast
-    ranges are refused so callers cannot make this server probe internal services.
+    Every resolved address must be public. Returning the addresses lets sensitive
+    outbound calls connect to one of the checked IPs without a second DNS lookup.
     """
     if not url or not isinstance(url, str):
-        return "A URL string is required."
+        return None, "A URL string is required."
     try:
         parsed = urlparse(url)
     except ValueError:
-        return "Invalid URL."
+        return None, "Invalid URL."
     if parsed.scheme not in ("http", "https"):
-        return "URL must use http or https."
+        return None, "URL must use http or https."
     hostname = parsed.hostname
     if not hostname:
-        return "URL has no hostname."
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        return None, "URL has no hostname."
     try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
         addr_infos = socket.getaddrinfo(hostname, port, proto=socket.IPPROTO_TCP)
-    except (socket.gaierror, UnicodeError, OverflowError):
-        return f"Could not resolve hostname '{hostname}'."
+    except (socket.gaierror, UnicodeError, OverflowError, ValueError):
+        return None, f"Could not resolve hostname '{hostname}'."
+    addresses = []
     for info in addr_infos:
         try:
-            ip = ipaddress.ip_address(info[4][0])
+            address = info[4][0]
+            ip = ipaddress.ip_address(address)
         except ValueError:
-            return "URL resolves to an unparsable address."
+            return None, "URL resolves to an unparsable address."
         if not ip.is_global or ip.is_multicast:
-            return "URL resolves to a non-public network address; refusing to fetch it."
-    return None
+            return None, "URL resolves to a non-public network address; refusing to fetch it."
+        if address not in addresses:
+            addresses.append(address)
+    if not addresses:
+        return None, f"Could not resolve hostname '{hostname}'."
+    return addresses, None
+
+
+def validate_public_http_url(url) -> str | None:
+    """Reject URLs that are not public http(s) targets (SSRF guard)."""
+    _, error = resolve_public_http_url(url)
+    return error
+
+
+def post_callback_event(callback_url: str, payload: dict):
+    """POST through the shared session, pinned to a validated public address."""
+    addresses, error = resolve_public_http_url(callback_url)
+    if error:
+        raise ValueError(f"Unsafe callback URL: {error}")
+
+    # Requests converts international hostnames to IDNA ASCII before proxy
+    # selection, so build the proxy bypass keys from its normalized URL.
+    prepared_callback_url = requests.Request("POST", callback_url).prepare().url
+    parsed_callback_url = urlparse(prepared_callback_url)
+    callback_hostname = parsed_callback_url.hostname
+    direct_connection_proxies = {
+        "http": None,
+        "https": None,
+        "all": None,
+        f"{parsed_callback_url.scheme}://{callback_hostname}": None,
+        f"all://{callback_hostname}": None,
+    }
+    last_connection_error = None
+    for address in addresses:
+        pin_token = _pinned_public_ip.set(address)
+        try:
+            response = SESSION.post(
+                callback_url,
+                json=payload,
+                timeout=10,
+                allow_redirects=False,
+                proxies=direct_connection_proxies,
+            )
+            response.raise_for_status()
+            return response
+        except requests.exceptions.ConnectionError as connection_error:
+            # Try another checked address if this address is unreachable. A
+            # response status error is not retried against another host.
+            last_connection_error = connection_error
+        finally:
+            _pinned_public_ip.reset(pin_token)
+
+    if last_connection_error:
+        raise last_connection_error
+    raise requests.exceptions.ConnectionError("No callback address could be reached")
 
 # --- Helper Functions (Shared & Feature-Specific) ---
 
@@ -777,6 +933,54 @@ def get_page_title_from_html(html_content):
         return title_tag.string.strip() if title_tag and title_tag.string else "N/A"
     except Exception: return "N/A"
 
+
+CRAWL_FAILURE_CODES = {
+    "site_unreachable", "blocked", "timed_out", "no_readable_content",
+}
+
+
+class CrawlServiceError(ConnectionError):
+    """A crawl error with a stable, client-facing failure code."""
+    def __init__(self, message: str, error_code: str = "site_unreachable"):
+        super().__init__(message)
+        self.error_code = error_code if error_code in CRAWL_FAILURE_CODES else "site_unreachable"
+
+
+def crawl_failure_code(error) -> str:
+    """Map network and crawl failures to the small public error-code vocabulary."""
+    current = error
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (requests.exceptions.Timeout, TimeoutError)):
+            return "timed_out"
+        response = getattr(current, "response", None)
+        status_code = getattr(response, "status_code", None)
+        if status_code in (401, 403, 429):
+            return "blocked"
+        if status_code in (408, 504):
+            return "timed_out"
+        if status_code:
+            return "site_unreachable"
+        current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+
+    message = str(error or "").lower()
+    if "timed out" in message or "timeout" in message:
+        return "timed_out"
+    if re.search(r"\b(401|403|429)\b", message) or "robots.txt disallow" in message:
+        return "blocked"
+    if "no readable" in message or "no extractable" in message:
+        return "no_readable_content"
+    return "site_unreachable"
+
+
+def _http_error_code(status_code: int) -> str:
+    if status_code in (401, 403, 429):
+        return "blocked"
+    if status_code in (408, 504):
+        return "timed_out"
+    return "site_unreachable"
+
 def fetch_url_html_content(url: str, for_lang_detect=False) -> str | None:
     headers = {'User-Agent': CRAWLER_USER_AGENT}
     try:
@@ -797,7 +1001,10 @@ def fetch_url_html_content(url: str, for_lang_detect=False) -> str | None:
             return response.text[:MAX_HTML_CONTENT_LENGTH]
     except requests.exceptions.RequestException as req_err:
         logger.error(f"Error fetching HTML for {url}: {req_err}")
-        if not for_lang_detect: raise ConnectionError(f"Failed to fetch URL content: {req_err}") from req_err
+        if not for_lang_detect:
+            raise CrawlServiceError(
+                f"Failed to fetch URL content: {req_err}", crawl_failure_code(req_err)
+            ) from req_err
     return None
 
 def clean_text_from_html(html: str, url: str = None) -> str:
@@ -970,13 +1177,14 @@ def find_sitemap_urls(base_url: str):
 
 def simple_crawl_website(base_url, max_pages=10):
     logger.info(f"Starting simple crawl for {base_url}, max_pages={max_pages}")
-    urls_to_visit = {base_url}
+    urls_to_visit = collections.deque([base_url])
+    queued_urls = {base_url}
     visited_urls = set()
     found_pages_details = []
     base_domain = urlparse(base_url).netloc
     robots = get_robots_parser(base_url)
     while urls_to_visit and len(found_pages_details) < max_pages:
-        current_url = urls_to_visit.pop()
+        current_url = urls_to_visit.popleft()
         if current_url in visited_urls or urlparse(current_url).netloc != base_domain:
             continue
         visited_urls.add(current_url)
@@ -989,14 +1197,19 @@ def simple_crawl_website(base_url, max_pages=10):
             response = SESSION.get(current_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
             response.raise_for_status()
             if response.status_code == 200 and 'text/html' in response.headers.get('Content-Type', '').lower():
-                 found_pages_details.append({'url': current_url, 'status': 'found'})
-                 logger.info(f"[Simple] Found page ({len(found_pages_details)}/{max_pages}): {current_url}")
-                 soup = BeautifulSoup(response.text, 'html.parser')
-                 for link in soup.find_all('a', href=True):
+                found_pages_details.append({'url': current_url, 'status': 'found'})
+                logger.info(f"[Simple] Found page ({len(found_pages_details)}/{max_pages}): {current_url}")
+                soup = BeautifulSoup(response.text, 'html.parser')
+                discovered_links = set()
+                for link in soup.find_all('a', href=True):
                     absolute_url = urljoin(base_url, link['href'])
                     absolute_url = urlparse(absolute_url)._replace(fragment="").geturl()
-                    if urlparse(absolute_url).netloc == base_domain and absolute_url not in visited_urls:
-                         urls_to_visit.add(absolute_url)
+                    if urlparse(absolute_url).netloc == base_domain:
+                        discovered_links.add(absolute_url)
+                for absolute_url in sorted(discovered_links):
+                    if absolute_url not in visited_urls and absolute_url not in queued_urls:
+                        urls_to_visit.append(absolute_url)
+                        queued_urls.add(absolute_url)
         except requests.exceptions.RequestException as e:
             logger.error(f"[Simple] Error crawling URL {current_url}: {e}")
     return found_pages_details
@@ -1005,7 +1218,8 @@ def simple_crawl_website(base_url, max_pages=10):
 def selenium_crawl_website(base_url, max_pages=10):
     if not SELENIUM_AVAILABLE: raise RuntimeError("Selenium is not available.")
     logger.info(f"Starting Selenium crawl for {base_url}, max_pages={max_pages}")
-    urls_to_visit = {base_url}
+    urls_to_visit = collections.deque([base_url])
+    queued_urls = {base_url}
     visited_urls = set()
     found_pages_details = []
     base_domain = urlparse(base_url).netloc
@@ -1021,7 +1235,7 @@ def selenium_crawl_website(base_url, max_pages=10):
         driver = webdriver.Chrome(service=service, options=chrome_options)
         driver.set_page_load_timeout(SELENIUM_PAGE_LOAD_TIMEOUT)
         while urls_to_visit and len(found_pages_details) < max_pages:
-            current_url = urls_to_visit.pop()
+            current_url = urls_to_visit.popleft()
             if current_url in visited_urls or urlparse(current_url).netloc != base_domain:
                 continue
             visited_urls.add(current_url)
@@ -1036,14 +1250,19 @@ def selenium_crawl_website(base_url, max_pages=10):
                 page_html = driver.page_source
                 found_pages_details.append({'url': current_url, 'title': page_title, 'status': 'found_by_selenium', 'html_source': page_html})
                 logger.info(f"[Selenium] Found page ({len(found_pages_details)}/{max_pages}): {current_url}")
+                discovered_links = set()
                 links = driver.find_elements(By.TAG_NAME, 'a')
                 for link in links:
                     href = link.get_attribute('href')
                     if href:
                         absolute_url = urljoin(current_url, href)
                         absolute_url = urlparse(absolute_url)._replace(fragment="").geturl()
-                        if urlparse(absolute_url).netloc == base_domain and absolute_url not in visited_urls:
-                            urls_to_visit.add(absolute_url)
+                        if urlparse(absolute_url).netloc == base_domain:
+                            discovered_links.add(absolute_url)
+                for absolute_url in sorted(discovered_links):
+                    if absolute_url not in visited_urls and absolute_url not in queued_urls:
+                        urls_to_visit.append(absolute_url)
+                        queued_urls.add(absolute_url)
             except (TimeoutException, WebDriverException) as e:
                 logger.error(f"[Selenium] Error for URL {current_url}: {e}")
     finally:
@@ -1306,7 +1525,7 @@ def detect_language_from_html_with_openai(html_snippet: str, url: str) -> tuple[
 
 
 def detect_site_language(main_page_html: str, base_url: str, candidate_pages: list,
-                         cost: "CostAccumulator") -> str:
+                         cost: "CostAccumulator", prepared_pages: list = None) -> str:
     """Robustly determine the site's primary language from SOURCE content.
 
     Deterministic script detection first (reliable for Persian/Arabic and immune to slow or
@@ -1324,14 +1543,18 @@ def detect_site_language(main_page_html: str, base_url: str, candidate_pages: li
             if lang and lang != DEFAULT_TARGET_LANGUAGE:
                 return lang
 
-    for pg in (candidate_pages or [])[:4]:
-        try:
-            html = fetch_url_html_content(pg.get("url"))
-        except Exception:
-            html = None
-        if not html:
-            continue
-        clean = clean_text_from_html(html, pg.get("url"))
+    page_sources = prepared_pages if prepared_pages is not None else candidate_pages
+    for pg in (page_sources or [])[:4]:
+        if "text" in pg:
+            clean = pg.get("text", "")
+        else:
+            try:
+                html = fetch_url_html_content(pg.get("url"))
+            except Exception:
+                html = None
+            if not html:
+                continue
+            clean = clean_text_from_html(html, pg.get("url"))
         det = detect_language_deterministic(clean)
         if det:
             return det
@@ -1556,7 +1779,9 @@ def extract_website_colors_with_openai(html_content: str, url: str, screenshot_b
             "brand_color_description": "Default black text (fallback)"
         }, p_tokens, c_tokens
 
-def extract_knowledge_from_page_with_openai(html_content: str, url: str, title: str, lang: str, screenshot_base64: str = None) -> tuple[dict, int, int]:
+def extract_knowledge_from_page_with_openai(html_content: str, url: str, title: str, lang: str,
+                                           screenshot_base64: str = None,
+                                           cleaned_text: str = None) -> tuple[dict, int, int]:
     """Extract customer-relevant knowledge from one page into a structured chunk.
 
     Feeds CLEAN main-content text (not raw HTML) to the cheap model and classifies the page
@@ -1567,7 +1792,7 @@ def extract_knowledge_from_page_with_openai(html_content: str, url: str, title: 
     """
     if not openai_client: raise ConnectionError("Vercel AI Gateway client not initialized.")
 
-    clean_text = clean_text_from_html(html_content, url)
+    clean_text = cleaned_text if cleaned_text is not None else clean_text_from_html(html_content, url)
     section_keys_str = ", ".join(KB_SECTION_KEYS)
     lang_name = language_name(lang)
 
@@ -1813,7 +2038,7 @@ def run_prospect_qualification_job(job_id, user_profile, user_personas, prospect
             })
 
 # =====================================================================================
-# Overhauled KB pipeline: discovery -> deterministic pre-filter -> AI selection ->
+# Overhauled KB pipeline: discovery -> deterministic pre-filter and selection ->
 # parallel clean-text extraction -> per-section map-reduce synthesis -> assembly -> audit.
 # Designed to scale to 1000+ page sites without ever sending the catalogue to an LLM.
 # =====================================================================================
@@ -1956,7 +2181,15 @@ def discover_all_candidate_urls(base_url: str, use_selenium: bool = False):
     if len(candidates) > MAX_DISCOVERY_URLS:
         meta["capped"] = True
         logger.info(f"Discovery cap hit: {len(candidates)} URLs -> {MAX_DISCOVERY_URLS}")
-        candidates = candidates[:MAX_DISCOVERY_URLS]
+        base_norm = urlparse(base_url)._replace(fragment="").geturl()
+        unique_candidates = set(url for url in candidates if isinstance(url, str) and url)
+        unique_candidates.discard(base_norm)
+
+        ranked_candidates = sorted(
+            unique_candidates,
+            key=lambda url: (-knowledge_path_score(url), url),
+        )
+        candidates = [base_norm] + ranked_candidates[:max(0, MAX_DISCOVERY_URLS - 1)]
 
     return candidates, meta, sitemap_meta
 
@@ -2063,6 +2296,86 @@ def select_knowledge_pages(base_url: str, candidate_urls: list, lang: str, page_
     return selected[:page_budget], selection_meta
 
 
+def select_knowledge_pages_deterministically(base_url: str, candidate_urls: list,
+                                              page_budget: int, sitemap_meta: dict = None):
+    """Select a stable page set so a job fingerprint can be compared on later crawls."""
+    base_domain = urlparse(base_url).netloc
+    stable_candidates = sorted(
+        url for url in candidate_urls if isinstance(url, str) and url
+    )
+    kept, dropped_counts = prefilter_candidate_urls(stable_candidates, base_domain)
+    base_norm = urlparse(base_url)._replace(fragment="").geturl()
+    kept = list(dict.fromkeys(kept))
+    if base_norm in kept:
+        kept.remove(base_norm)
+
+    # Rank by stable URL features only. Sitemap metadata can change without page text
+    # changing, so it must not move a different URL into the budgeted fingerprint set.
+    kept.sort(key=lambda url: (-knowledge_path_score(url), url))
+    selected = [{"url": base_norm, "cluster": "company_information"}]
+    for url in kept:
+        if len(selected) >= page_budget:
+            break
+        selected.append({
+            "url": url,
+            "cluster": "auto_keyword" if knowledge_path_score(url) >= 2.0 else "company_information",
+        })
+
+    return selected[:page_budget], {
+        "candidates_total": len(candidate_urls),
+        "after_prefilter": len(kept) + (1 if base_norm not in kept else 0),
+        "dropped_by_reason": dropped_counts,
+        "clusters": None,
+        "auto_selected_by_keyword": sum(
+            1 for page in selected[1:] if page["cluster"] == "auto_keyword"
+        ),
+        "llm_selection_skipped": True,
+        "selection_method": "deterministic_fingerprint_stable",
+    }
+
+
+def select_specific_pages_deterministically(base_url: str, pages: list[dict], page_budget: int):
+    """Apply a stable budget to explicitly supplied pages, preserving the homepage first."""
+    base_norm = urlparse(base_url)._replace(fragment="").geturl()
+    unique_pages = {}
+    for page in pages or []:
+        url = urlparse(page.get("url", ""))._replace(fragment="").geturl()
+        if url:
+            unique_pages.setdefault(url, {"url": url, "cluster": page.get("cluster", "company_information")})
+    ordered = sorted(unique_pages.values(), key=lambda page: (
+        page["url"] != base_norm,
+        -knowledge_path_score(page["url"]),
+        page["url"],
+    ))
+    return ordered[:page_budget]
+
+
+SOURCE_FINGERPRINT_VERSION = "clean-text-v1"
+
+
+def fingerprint_source_page(url: str, title: str, text: str) -> str:
+    """Hash the fetched page title and cleaned source text, before model processing."""
+    source = json.dumps(
+        {"version": SOURCE_FINGERPRINT_VERSION, "title": title or "", "text": text or ""},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    return hashlib.sha256(source.encode("utf-8", "ignore")).hexdigest()
+
+
+def fingerprint_source_pages(pages: list[dict]) -> str:
+    """Hash the ordered set of page addresses and their source fingerprints."""
+    page_rows = []
+    for page in pages:
+        url = urlparse(page.get("url", ""))._replace(fragment="").geturl()
+        page_rows.append({"url": url, "fingerprint": page.get("fingerprint", "")})
+    page_rows.sort(key=lambda row: row["url"])
+    payload = json.dumps(
+        {"version": SOURCE_FINGERPRINT_VERSION, "pages": page_rows},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8", "ignore")).hexdigest()
+
+
 def harvest_contact_candidates(texts: list) -> dict:
     """Regex-harvest emails/phones across all page texts as a contact safety-net."""
     emails, phones = set(), set()
@@ -2130,7 +2443,11 @@ def extract_pages_parallel(pages: list, lang: str, cost: CostAccumulator,
             except Exception as e:
                 logger.debug(f"Structured-data harvest failed for {url}: {e}")
 
-            title = get_page_title_from_html(html) or page.get("title", "N/A")
+            title = get_page_title_from_html(html)
+            if not title or title == "N/A":
+                slug = unquote(urlparse(url).path or "").strip("/").split("/")[-1]
+                title = page.get("title") or (slug.replace("-", " ").replace("_", " ").title()
+                                               if slug else urlparse(url).netloc)
             screenshot = main_page_screenshot if (main_page_url and url == main_page_url) else None
 
             content_hash = hashlib.sha256(clean_probe.encode('utf-8', 'ignore')).hexdigest()
@@ -2171,6 +2488,172 @@ def extract_pages_parallel(pages: list, lang: str, cost: CostAccumulator,
     if stats["cache_hits"]:
         logger.info(f"Extraction cache: {stats['cache_hits']}/{total} pages served for free")
     return results, structured_list, stats
+
+
+def fetch_clean_pages_parallel(pages: list, use_selenium: bool = False,
+                               prefetched_html: dict = None, job_id: str = None):
+    """Fetch and clean source pages without any model calls; attach stable fingerprints."""
+    prepared, structured_list, failures = [], [], []
+    result_lock = threading.Lock()
+    total = len(pages)
+    done = {"n": 0}
+    selenium_budget = {"n": 0}
+    stats = {"selenium_fallbacks": 0}
+    prefetched_html = prefetched_html or {}
+    robots_by_origin = {}
+    for page in pages:
+        parsed = urlparse(page.get("url", ""))
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        if origin not in robots_by_origin:
+            try:
+                robots_by_origin[origin] = get_robots_parser(origin)
+            except Exception as error:
+                logger.debug(f"Could not read robots.txt for {origin}: {error}")
+                robots_by_origin[origin] = None
+
+    def _work(page):
+        url = page["url"]
+
+        def _record_failure(message, error_code="no_readable_content"):
+            with result_lock:
+                failures.append({
+                    "url": url,
+                    "error": message,
+                    "error_code": error_code,
+                })
+
+        try:
+            parsed = urlparse(url)
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            if not robots_allows(robots_by_origin.get(origin), url):
+                _record_failure("The URL is disallowed by robots.txt.", "blocked")
+                return None
+
+            html = prefetched_html.get(url)
+            if html is None:
+                html = fetch_url_html_content(url)
+            if not html:
+                _record_failure("No HTML content was returned for this page.")
+                return None
+
+            clean_text = clean_text_from_html(html, url)
+            if (SELENIUM_AVAILABLE and len(clean_text) < SELENIUM_FALLBACK_MIN_TEXT
+                    and len(html) > SELENIUM_FALLBACK_MIN_HTML):
+                with result_lock:
+                    allowed = selenium_budget["n"] < SELENIUM_FALLBACK_MAX_PAGES
+                    if allowed:
+                        selenium_budget["n"] += 1
+                if allowed:
+                    try:
+                        rendered = fetch_page_html_via_selenium(url)
+                        rendered_text = clean_text_from_html(rendered, url) if rendered else ""
+                        if len(rendered_text) > len(clean_text):
+                            html, clean_text = rendered, rendered_text
+                            with result_lock:
+                                stats["selenium_fallbacks"] += 1
+                    except Exception as selenium_error:
+                        logger.debug(f"Selenium fallback failed for {url}: {selenium_error}")
+
+            if not clean_text.strip():
+                _record_failure("The page contained no readable text after cleaning.")
+                return None
+
+            title = get_page_title_from_html(html) or page.get("title", "N/A")
+            source_fingerprint = fingerprint_source_page(url, title, clean_text)
+            try:
+                structured = extract_structured_data(html, url)
+                with result_lock:
+                    structured_list.append(structured)
+            except Exception as structured_error:
+                logger.debug(f"Structured-data harvest failed for {url}: {structured_error}")
+
+            return {
+                "url": url,
+                "title": title,
+                "fingerprint": source_fingerprint,
+                "text": clean_text,
+                "cluster": page.get("cluster", "company_information"),
+            }
+        except Exception as error:
+            failure = {
+                "url": url,
+                "error": str(error),
+                "error_code": getattr(error, "error_code", crawl_failure_code(error)),
+            }
+            with result_lock:
+                failures.append(failure)
+            logger.warning(f"Source page fetch failed for {url}: {error}")
+            return None
+        finally:
+            with result_lock:
+                done["n"] += 1
+                if job_id:
+                    update_job_progress(job_id, f"Reading source page {done['n']}/{total}...")
+
+    workers = max(1, min(KB_EXTRACTION_WORKERS, total))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_work, page) for page in pages]
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            if result:
+                prepared.append(result)
+
+    # Output order follows selected URL order, not thread completion order.
+    order = {page["url"]: index for index, page in enumerate(pages)}
+    prepared.sort(key=lambda page: order.get(page["url"], len(order)))
+    return prepared, structured_list, stats, failures
+
+
+def extract_prepared_pages_parallel(pages: list, lang: str, cost: CostAccumulator,
+                                    main_page_url: str = None, main_page_screenshot: str = None,
+                                    job_id: str = None):
+    """Run the cheap per-page model on already fetched source text."""
+    results, result_lock = [], threading.Lock()
+    total, done = len(pages), {"n": 0}
+    stats = {"cache_hits": 0}
+
+    def _work(page):
+        url, title, text = page["url"], page["title"], page["text"]
+        screenshot = main_page_screenshot if main_page_url and url == main_page_url else None
+        try:
+            data = None if screenshot else load_cached_extraction(url, lang, page["fingerprint"])
+            if data is not None:
+                with result_lock:
+                    stats["cache_hits"] += 1
+            else:
+                data, prompt_tokens, completion_tokens = extract_knowledge_from_page_with_openai(
+                    "", url, title, lang, screenshot, cleaned_text=text
+                )
+                cost.add(OPENAI_MODEL_CHEAP, prompt_tokens, completion_tokens)
+                if data and not screenshot:
+                    store_cached_extraction(url, lang, page["fingerprint"], data, OPENAI_MODEL_CHEAP)
+            if data and data.get("extracted_chunk", "").strip():
+                data = dict(data)
+                data.setdefault("url", url)
+                data.setdefault("title_suggestion", title)
+                data.setdefault("cluster", page.get("cluster"))
+                return data
+            return None
+        except Exception as error:
+            logger.error(f"Failed to extract {url}: {error}")
+            return None
+        finally:
+            with result_lock:
+                done["n"] += 1
+                if job_id:
+                    update_job_progress(job_id, f"Extracting knowledge {done['n']}/{total} pages...")
+
+    workers = max(1, min(KB_EXTRACTION_WORKERS, total))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_work, page) for page in pages]
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            if result:
+                with result_lock:
+                    results.append(result)
+    if stats["cache_hits"]:
+        logger.info(f"Extraction cache: {stats['cache_hits']}/{total} pages served for free")
+    return results, stats
 
 
 def _batch_chunks_by_tokens(texts: list, token_budget: int) -> list:
@@ -2342,33 +2825,133 @@ def check_kb_completeness(document: str, lang: str, contact_candidates: dict,
 
 
 def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, specific_pages=None,
-                           depth="deep", target_doc_tokens=TARGET_DOC_TOKENS):
+                           depth="deep", target_doc_tokens=TARGET_DOC_TOKENS,
+                           previous_fingerprint=None):
     logger.info(f"Starting KB job {job_id} for {base_url} (depth={depth}, budget={max_pages_for_kb})")
-    with jobs_lock: jobs[job_id].update({"status": "running", "started_at": time.time()})
+    with jobs_lock:
+        jobs[job_id].update({"status": "running", "started_at": time.time()})
 
     cost = CostAccumulator()
     main_page_screenshot = None
     page_budget = max(1, min(int(max_pages_for_kb or DEFAULT_KB_PAGE_BUDGET), MAX_KB_PAGE_BUDGET))
+    source_pages, page_results, source_fingerprint = [], [], None
+    fetch_failures = []
 
     try:
-        # 1. Fetch homepage (full) for colour + language detection.
+        # Fetch and clean source content before any model call. Fingerprint-aware refreshes
+        # can therefore return immediately without extraction, synthesis, or audit calls.
         update_job_progress(job_id, "Fetching homepage...")
+        homepage_failure = None
         try:
-            main_page_html = fetch_url_html_content(base_url)
-        except Exception as e:
-            logger.warning(f"Homepage fetch failed for colour/language detection: {e}")
+            homepage_robots = get_robots_parser(base_url)
+        except Exception as error:
+            logger.debug(f"Could not read homepage robots rules: {error}")
+            homepage_robots = None
+        if not robots_allows(homepage_robots, base_url):
+            homepage_failure = CrawlServiceError(
+                "The homepage URL is disallowed by robots.txt.", "blocked"
+            )
             main_page_html = None
-        lang = DEFAULT_TARGET_LANGUAGE
+        else:
+            try:
+                main_page_html = fetch_url_html_content(base_url)
+            except Exception as error:
+                homepage_failure = error
+                logger.warning(f"Homepage fetch failed: {error}")
+                main_page_html = None
 
-        # 2. Main page screenshot (visual context for the main-page extraction)
+        discovery_meta, selection_meta = {}, {}
+        if specific_pages:
+            update_job_progress(job_id, "Discovering core website pages...")
+            discovered = discover_core_pages_only(base_url, specific_pages)
+            specified_pages = [{"url": page["url"], "cluster": page.get("type", "company_information")}
+                               for page in discovered]
+            selected = select_specific_pages_deterministically(base_url, specified_pages, page_budget)
+            discovery_meta = {"method": "specified", "count": len(selected)}
+            selection_meta = {
+                "candidates_total": len(discovered),
+                "selection_method": "specified_stable",
+                "llm_selection_skipped": True,
+            }
+        elif depth == "core":
+            update_job_progress(job_id, "Discovering core website pages...")
+            discovered = discover_core_pages_only(base_url)
+            selected = [{"url": page["url"], "cluster": page.get("type", "company_information")}
+                        for page in discovered][:page_budget]
+            discovery_meta = {"method": "core_patterns", "count": len(selected)}
+        else:
+            update_job_progress(job_id, "Discovering all pages (Sitemap)...")
+            candidates, discovery_meta, sitemap_meta = discover_all_candidate_urls(base_url, use_selenium)
+            selected, selection_meta = select_knowledge_pages_deterministically(
+                base_url, candidates, page_budget, sitemap_meta=sitemap_meta
+            )
+
+        with jobs_lock:
+            jobs[job_id]["initial_found_pages_count"] = len(selected)
+        logger.info(f"Selected {len(selected)} pages for source fingerprinting")
+
+        update_job_progress(job_id, "Reading source pages...")
+        prefetched = {base_url: main_page_html} if main_page_html else {}
+        source_pages, per_page_structured, source_stats, fetch_failures = fetch_clean_pages_parallel(
+            selected, use_selenium=use_selenium, prefetched_html=prefetched, job_id=job_id
+        )
+        if not source_pages:
+            root_failure = next((failure for failure in fetch_failures
+                                 if failure.get("url") == base_url), None)
+            error_code = (root_failure or {}).get("error_code")
+            if not error_code and homepage_failure:
+                error_code = getattr(homepage_failure, "error_code", crawl_failure_code(homepage_failure))
+            if not error_code and fetch_failures:
+                error_code = fetch_failures[0].get("error_code")
+            error_code = error_code or "no_readable_content"
+            raise CrawlServiceError(
+                "No readable page content could be fetched from the selected URLs.", error_code
+            )
+
+        source_fingerprint = fingerprint_source_pages(source_pages)
+        page_results = [
+            {"url": page["url"], "title": page["title"], "fingerprint": page["fingerprint"],
+             "text": page["text"]}
+            for page in source_pages
+        ]
+        page_fingerprints = {page["url"]: page["fingerprint"] for page in page_results}
+
+        if (previous_fingerprint and not fetch_failures and len(source_pages) == len(selected)
+                and hmac.compare_digest(
+                source_fingerprint, previous_fingerprint.lower())):
+            finished_at = time.time()
+            update_job_progress(job_id, "Source pages are unchanged; skipping model processing.")
+            with jobs_lock:
+                jobs[job_id].update({
+                    "status": "completed",
+                    "unchanged": True,
+                    "source_fingerprint": source_fingerprint,
+                    "page_fingerprints": page_fingerprints,
+                    "pages": page_results,
+                    "source_pages_count": len(page_results),
+                    "extracted_pages_count": 0,
+                    "cost_estimation": cost.cost_estimation(),
+                    "finished_at": finished_at,
+                })
+                if page_budget == 1:
+                    jobs[job_id]["single_page_text"] = page_results[0]["text"]
+            notify_job_callback(job_id)
+            return
+
+        update_job_progress(job_id, "Detecting language...")
+        lang = detect_site_language(main_page_html, base_url, selected, cost,
+                                    prepared_pages=source_pages)
+        with jobs_lock:
+            jobs[job_id]["detected_target_language"] = lang
+        logger.info(f"Detected target language: {lang} ({language_name(lang)})")
+
+        # Expensive or visual enrichment is deferred until after the unchanged check.
         update_job_progress(job_id, "Capturing main page screenshot...")
-        main_page_screenshot = capture_full_page_screenshot(base_url)
+        main_page_screenshot = (capture_full_page_screenshot(base_url)
+                                if robots_allows(homepage_robots, base_url) else None)
         if not main_page_screenshot:
             logger.warning("Could not capture main page screenshot - continuing without visual context")
 
-        # 2.5 Brand kit: deterministic logo / palette / fonts / socials measured from the
-        # real site (CSS + screenshot pixels + schema.org). The old LLM color guess only
-        # runs as a fallback when nothing could be measured.
         update_job_progress(job_id, "Extracting website colors...")
         website_colors = {
             "main_background_color": "#ffffff", "primary_brand_color": "#000000",
@@ -2379,15 +2962,15 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
         if main_page_html:
             try:
                 homepage_structured = extract_structured_data(main_page_html, base_url)
-            except Exception as e:
-                logger.debug(f"Homepage structured-data harvest failed: {e}")
+            except Exception as error:
+                logger.debug(f"Homepage structured-data harvest failed: {error}")
             try:
                 brand_kit_data = build_brand_kit(
                     main_page_html, base_url, main_page_screenshot, homepage_structured,
                     session=SESSION, url_validator=validate_public_http_url,
                     reports_dir=REPORTS_DIR)
-            except Exception as e:
-                logger.warning(f"Brand kit extraction failed: {e}")
+            except Exception as error:
+                logger.warning(f"Brand kit extraction failed: {error}")
         palette = (brand_kit_data or {}).get("palette") or {}
         if palette.get("primary"):
             website_colors = {
@@ -2398,49 +2981,24 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
             }
         elif main_page_html:
             try:
-                colors, p, c = extract_website_colors_with_openai(main_page_html, base_url, main_page_screenshot)
+                colors, prompt_tokens, completion_tokens = extract_website_colors_with_openai(
+                    main_page_html, base_url, main_page_screenshot
+                )
                 website_colors = colors
-                cost.add(OPENAI_MODEL_CHEAP, p, c)
-            except Exception as e:
-                logger.error(f"Failed to extract website colors: {e}")
+                cost.add(OPENAI_MODEL_CHEAP, prompt_tokens, completion_tokens)
+            except Exception as error:
+                logger.error(f"Failed to extract website colors: {error}")
 
-        # 3. Discovery + intelligent selection
-        discovery_meta, selection_meta = {}, {}
-        if specific_pages:
-            update_job_progress(job_id, "Discovering core website pages...")
-            discovered = discover_core_pages_only(base_url, specific_pages)
-            selected = [{"url": d["url"], "cluster": d.get("type", "company_information")} for d in discovered][:page_budget]
-            discovery_meta = {"method": "specified", "count": len(selected)}
-        elif depth == "core":
-            update_job_progress(job_id, "Discovering core website pages...")
-            discovered = discover_core_pages_only(base_url)
-            selected = [{"url": d["url"], "cluster": d.get("type", "company_information")} for d in discovered][:page_budget]
-            discovery_meta = {"method": "core_patterns", "count": len(selected)}
-        else:
-            update_job_progress(job_id, "Discovering all pages (Sitemap)...")
-            candidates, discovery_meta, sitemap_meta = discover_all_candidate_urls(base_url, use_selenium)
-            update_job_progress(job_id, "Identifying knowledge-rich content clusters...")
-            selected, selection_meta = select_knowledge_pages(base_url, candidates, lang, page_budget,
-                                                              cost, sitemap_meta=sitemap_meta)
-
-        with jobs_lock: jobs[job_id]["initial_found_pages_count"] = len(selected)
-        logger.info(f"Selected {len(selected)} knowledge pages for extraction")
-
-        # 3.5 Detect the site's primary language from SOURCE content (deterministic-first).
-        update_job_progress(job_id, "Detecting language...")
-        lang = detect_site_language(main_page_html, base_url, selected, cost)
-        with jobs_lock: jobs[job_id]["detected_target_language"] = lang
-        logger.info(f"Detected target language: {lang} ({language_name(lang)})")
-
-        # 4. Parallel per-page extraction (clean text -> cheap model) + free structured harvest
+        # Per-page model extraction uses the exact cleaned source text that was fingerprinted.
         update_job_progress(job_id, "Extracting knowledge from pages...")
-        chunks, per_page_structured, extraction_stats = extract_pages_parallel(
-            selected, lang, cost,
-            main_page_url=base_url, main_page_screenshot=main_page_screenshot, job_id=job_id,
+        chunks, extraction_stats = extract_prepared_pages_parallel(
+            source_pages, lang, cost, main_page_url=base_url,
+            main_page_screenshot=main_page_screenshot, job_id=job_id,
         )
-        logger.info(f"Extraction complete: {len(chunks)} non-empty chunks from {len(selected)} pages")
+        extraction_stats.update(source_stats)
+        extraction_stats["fetch_failures"] = fetch_failures
+        logger.info(f"Extraction complete: {len(chunks)} non-empty chunks from {len(source_pages)} fetched pages")
 
-        # 4.5 Merge the deterministic JSON-LD/OpenGraph facts across pages (homepage included).
         if homepage_structured:
             per_page_structured.append(homepage_structured)
         structured_facts = merge_structured_facts(per_page_structured)
@@ -2448,7 +3006,6 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
         if structured_summary:
             logger.info(f"Structured facts harvested:\n{structured_summary}")
 
-        # 5. Contact safety-net + group chunks by canonical section
         contact_candidates = harvest_contact_candidates([c.get("extracted_chunk", "") for c in chunks])
         org = structured_facts.get("organization") or {}
         for email in org.get("emails", []):
@@ -2457,18 +3014,17 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
         for phone in org.get("phones", []):
             if phone not in contact_candidates["phones"]:
                 contact_candidates["phones"].append(phone)
-        section_chunks = {k: [] for k in KB_SECTION_KEYS}
-        for ch in chunks:
-            cat = ch.get("primary_category", "additional")
-            if cat not in section_chunks:
-                cat = "additional"
-            section_chunks[cat].append(ch)
+        section_chunks = {key: [] for key in KB_SECTION_KEYS}
+        for chunk in chunks:
+            category = chunk.get("primary_category", "additional")
+            if category not in section_chunks:
+                category = "additional"
+            section_chunks[category].append(chunk)
 
-        # 6. Per-section synthesis (strong model; map-reduce for large sections)
         section_outputs = {}
         structured_faq = structured_facts.get("faq") or []
         for key in KB_SECTION_KEYS:
-            chs = section_chunks.get(key, [])
+            section_parts = section_chunks.get(key, [])
             extra = ""
             if key == "contact":
                 extra_parts = []
@@ -2487,76 +3043,90 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
                 extra = ("Authoritative facts from the site's own structured data "
                          "(schema.org markup — treat as ground truth):\n" + structured_summary)
             elif key == "faq" and structured_faq:
-                faq_lines = "\n".join(f"Q: {f['question']}\nA: {f['answer']}" for f in structured_faq[:40])
+                faq_lines = "\n".join(f"Q: {item['question']}\nA: {item['answer']}"
+                                      for item in structured_faq[:40])
                 extra = ("FAQ pairs published in the site's own schema.org FAQPage markup "
                          "(authoritative — include them, translated into the target language):\n"
                          + faq_lines)
-            if not chs and not extra:
+            if not section_parts and not extra:
                 continue
             update_job_progress(job_id, f"Writing section: {section_title(key, lang)}...")
-            out = synthesize_section(key, section_title(key, lang), chs, base_url, lang, cost, extra)
-            if out.strip():
-                section_outputs[key] = out
+            output = synthesize_section(key, section_title(key, lang), section_parts,
+                                        base_url, lang, cost, extra)
+            if output.strip():
+                section_outputs[key] = output
 
-        # 7. Assemble the final single-context document
         update_job_progress(job_id, "Compiling comprehensive knowledge base...")
         if section_outputs:
-            final_kb, assembly_meta = assemble_final_kb(section_outputs, base_url, lang, cost, target_doc_tokens)
+            final_kb, assembly_meta = assemble_final_kb(
+                section_outputs, base_url, lang, cost, target_doc_tokens
+            )
         else:
             final_kb = f"# Knowledge Base\n\nNo extractable customer knowledge was found on {base_url}."
             assembly_meta = {"sections_present": [], "compressed_sections": [], "trimmed": False,
                              "final_doc_tokens": count_tokens(final_kb)}
 
-        # 8. Completeness audit (cheap critic)
         update_job_progress(job_id, "Auditing knowledge base completeness...")
         quality_report = check_kb_completeness(final_kb, lang, contact_candidates, cost)
-
-        # 9. Cost + analysis summary
         cost_estimation = cost.cost_estimation()
-        pages_by_cluster = collections.Counter(pg.get("cluster", "unknown") for pg in selected)
+        pages_by_cluster = collections.Counter(page.get("cluster", "unknown") for page in source_pages)
         discovered_count = (discovery_meta.get("sitemap_urls", 0)
                             + discovery_meta.get("crawled_urls", 0)
                             + discovery_meta.get("count", 0))
         comprehensive_analysis = {
-            "total_pages_analyzed": len(selected),
+            "total_pages_analyzed": len(source_pages),
             "core_pages_processed": len(chunks),
             "pages_by_type": dict(pages_by_cluster),
             "extracted_pages_count": len(chunks),
+            "source_pages_count": len(source_pages),
             "discovery": discovery_meta,
             "selection": selection_meta,
             "sections": assembly_meta,
             "contact_candidates": contact_candidates,
             "structured_facts": structured_facts,
             "extraction_stats": extraction_stats,
+            "source_fingerprint": source_fingerprint,
+            "page_fingerprints": page_fingerprints,
             "analysis_summary": (f"Deep pipeline: discovered ~{discovered_count} URLs, selected "
-                                 f"{len(selected)} knowledge pages, extracted {len(chunks)}, "
+                                 f"{len(selected)} pages, extracted {len(chunks)}, "
                                  f"synthesised {len(section_outputs)} sections."),
         }
 
         update_job_progress(job_id, "Knowledge base generation completed successfully.")
-
-        # 10. Persist report
+        finished_at = time.time()
+        report_metadata = {
+            "extracted_pages_count": len(chunks),
+            "source_pages_count": len(page_results),
+            "pages": page_results,
+            "source_fingerprint": source_fingerprint,
+            "page_fingerprints": page_fingerprints,
+            "page_failures": fetch_failures,
+            "main_page_screenshot_captured": main_page_screenshot is not None,
+            "website_colors": website_colors,
+            "brand_kit": brand_kit_data,
+            "comprehensive_analysis": comprehensive_analysis,
+            "cost_estimation": cost_estimation,
+            "detected_target_language": lang,
+            "quality_report": quality_report,
+            "depth": depth,
+            "models": {"cheap": OPENAI_MODEL_CHEAP, "strong": OPENAI_MODEL_STRONG},
+            "finished_at": finished_at,
+        }
         try:
-            save_knowledge_base_report(job_id, base_url, final_kb, {
-                "extracted_pages_count": len(chunks),
-                "main_page_screenshot_captured": main_page_screenshot is not None,
-                "website_colors": website_colors,
-                "brand_kit": brand_kit_data,
-                "comprehensive_analysis": comprehensive_analysis,
-                "cost_estimation": cost_estimation,
-                "detected_target_language": lang,
-                "quality_report": quality_report,
-                "depth": depth,
-                "models": {"cheap": OPENAI_MODEL_CHEAP, "strong": OPENAI_MODEL_STRONG},
-                "finished_at": time.time(),
-            })
+            save_knowledge_base_report(job_id, base_url, final_kb, report_metadata)
             logger.info(f"Successfully saved knowledge base report for job {job_id}")
-        except Exception as e:
-            logger.error(f"Failed to save knowledge base report for job {job_id}: {e}")
+        except Exception as error:
+            logger.error(f"Failed to save knowledge base report for job {job_id}: {error}")
 
         with jobs_lock:
             jobs[job_id].update({
                 "status": "completed",
+                "unchanged": False,
+                "source_fingerprint": source_fingerprint,
+                "page_fingerprints": page_fingerprints,
+                "pages": page_results,
+                "page_failures": fetch_failures,
+                "source_pages_count": len(page_results),
                 "final_knowledge_base": final_kb,
                 "extracted_pages_count": len(chunks),
                 "main_page_screenshot_captured": main_page_screenshot is not None,
@@ -2565,12 +3135,31 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
                 "comprehensive_analysis": comprehensive_analysis,
                 "cost_estimation": cost_estimation,
                 "quality_report": quality_report,
+                "finished_at": finished_at,
+            })
+            if page_budget == 1 and page_results:
+                jobs[job_id]["single_page_text"] = page_results[0]["text"]
+        notify_job_callback(job_id)
+    except Exception as error:
+        logger.error(f"KB Job {job_id} failed: {error}", exc_info=True)
+        error_code = getattr(error, "error_code", crawl_failure_code(error))
+        update_job_progress(job_id, "Failed to generate knowledge base.")
+        with jobs_lock:
+            jobs[job_id].update({
+                "status": "failed", "error": str(error), "error_code": error_code,
                 "finished_at": time.time(),
             })
-    except Exception as e:
-        logger.error(f"KB Job {job_id} failed: {e}", exc_info=True)
-        update_job_progress(job_id, "Failed to generate knowledge base.")
-        with jobs_lock: jobs[job_id].update({"status": "failed", "error": str(e), "finished_at": time.time()})
+            if source_fingerprint:
+                jobs[job_id]["source_fingerprint"] = source_fingerprint
+            if page_results:
+                jobs[job_id]["pages"] = page_results
+                jobs[job_id]["page_fingerprints"] = {
+                    page["url"]: page["fingerprint"] for page in page_results
+                }
+                jobs[job_id]["source_pages_count"] = len(page_results)
+            if fetch_failures:
+                jobs[job_id]["page_failures"] = fetch_failures
+        notify_job_callback(job_id)
 
 
 # --- API Endpoints ---
@@ -2641,8 +3230,11 @@ def start_knowledge_base_generation():
 
     # Get specific pages if provided
     specific_pages = data.get('specific_pages')
-    if specific_pages and not isinstance(specific_pages, list):
-        return jsonify({"error": "'specific_pages' must be a list of URLs"}), 400
+    if 'specific_pages' in data:
+        if not isinstance(specific_pages, list):
+            return jsonify({"error": "'specific_pages' must be a list of URLs"}), 400
+        if not specific_pages:
+            return jsonify({"error": "'specific_pages' must contain at least one URL when provided"}), 400
     for sp in (specific_pages or []):
         url_error = validate_public_http_url(sp)
         if url_error:
@@ -2661,41 +3253,80 @@ def start_knowledge_base_generation():
         max_pages = int(data.get('max_pages', DEFAULT_KB_PAGE_BUDGET))
     except (TypeError, ValueError):
         return jsonify({"error": "'max_pages' must be an integer"}), 400
+    max_pages = max(1, min(max_pages, MAX_KB_PAGE_BUDGET))
 
-    # Validate URL accessibility before starting job
+    previous_fingerprint = data.get('previous_fingerprint', data.get('source_fingerprint'))
+    if previous_fingerprint is not None:
+        if not isinstance(previous_fingerprint, str) or not re.fullmatch(r'[0-9a-fA-F]{64}', previous_fingerprint):
+            return jsonify({"error": "'previous_fingerprint' must be a 64-character SHA-256 hex digest"}), 400
+        previous_fingerprint = previous_fingerprint.lower()
+
+    callback_url = data.get('callback_url')
+    if callback_url is not None:
+        if not isinstance(callback_url, str) or len(callback_url) > 2048:
+            return jsonify({"error": "'callback_url' must be a valid URL no longer than 2048 characters"}), 400
+        if not callback_url.strip():
+            callback_url = None
+        else:
+            callback_url = callback_url.strip()
+            callback_url_error = validate_public_http_url(callback_url)
+            if callback_url_error:
+                return jsonify({"error": f"Invalid 'callback_url': {callback_url_error}"}), 400
+
+    # Validate accessibility before starting a job, except when robots.txt disallows
+    # the base URL; the background crawler will then report a fixed blocked code.
     try:
-        test_response = SESSION.head(url, timeout=10, allow_redirects=True)
-        if test_response.status_code >= 400:
-            return jsonify({
-                "error": f"Website is not accessible. HTTP {test_response.status_code}: {test_response.reason}",
-                "status_code": test_response.status_code
-            }), 400
-    except requests.exceptions.ConnectionError:
+        preflight_robots = get_robots_parser(url)
+        if robots_allows(preflight_robots, url):
+            test_response = SESSION.head(url, timeout=10, allow_redirects=True)
+            status_code = test_response.status_code
+            reason = test_response.reason
+            if status_code in (405, 501):
+                # Some sites disable HEAD while serving normal GET requests.
+                probe_response = SESSION.get(url, timeout=10, allow_redirects=True, stream=True)
+                try:
+                    status_code = probe_response.status_code
+                    reason = probe_response.reason
+                finally:
+                    probe_response.close()
+            if status_code >= 400:
+                return jsonify({
+                    "error": f"Website is not accessible. HTTP {status_code}: {reason}",
+                    "status_code": status_code,
+                    "error_code": _http_error_code(status_code),
+                }), 400
+        else:
+            logger.info(f"Skipping preflight request for robots-disallowed URL: {url}")
+    except requests.exceptions.Timeout as error:
+        return jsonify({
+            "error": f"Website is not accessible. Connection timed out: {error}",
+            "error_code": "timed_out",
+        }), 400
+    except requests.exceptions.ConnectionError as error:
         return jsonify({
             "error": "Website is not accessible. Connection failed - the website may be down or the URL is incorrect.",
-            "details": "Please check the URL and try again"
-        }), 400
-    except requests.exceptions.Timeout:
-        return jsonify({
-            "error": "Website is not accessible. Connection timed out - the website is taking too long to respond.",
-            "details": "The website may be slow or experiencing issues"
+            "details": "Please check the URL and try again",
+            "error_code": crawl_failure_code(error),
         }), 400
     except requests.exceptions.RequestException as e:
         return jsonify({
             "error": f"Website is not accessible. Request failed: {str(e)}",
-            "details": "Please check the URL format and try again"
+            "details": "Please check the URL format and try again",
+            "error_code": crawl_failure_code(e),
         }), 400
     
     job_id = str(uuid.uuid4())
     register_job(job_id, {"id": job_id, "job_type": "knowledge_base_generation", "status": "pending",
-                          "created_at": time.time()})
+                          "created_at": time.time(), "callback_url": callback_url})
 
     thread = threading.Thread(target=run_knowledge_base_job,
                               args=(job_id, url, max_pages, bool(data.get('use_selenium', False)), specific_pages),
-                              kwargs={"depth": depth, "target_doc_tokens": target_doc_tokens})
+                              kwargs={"depth": depth, "target_doc_tokens": target_doc_tokens,
+                                      "previous_fingerprint": previous_fingerprint})
     thread.start()
     return jsonify({"message": "Knowledge base generation job started.", "job_id": job_id,
-                    "depth": depth, "page_budget": max_pages}), 202
+                    "depth": depth, "page_budget": max_pages,
+                    "max_pages_limit": MAX_KB_PAGE_BUDGET}), 202
 
 @app.route('/api/analyze-html', methods=['POST'])
 @require_api_key
@@ -2765,6 +3396,7 @@ def get_job_status(job_id):
     
     # To avoid sending huge KB in status checks, send a preview.
     job_copy = job.copy()
+    job_copy.pop("callback_url", None)
     if "final_knowledge_base" in job_copy and job_copy["final_knowledge_base"]:
         job_copy["final_knowledge_base_preview"] = job_copy["final_knowledge_base"][:500] + "..."
         # Only send the full KB if the job is completed
