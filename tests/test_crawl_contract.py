@@ -648,3 +648,155 @@ def test_job_status_exposes_page_contract_without_callback_url(monkeypatch):
     assert body["pages"][0]["text"] == "Clean source"
     assert body["source_fingerprint"] == "a" * 64
     assert "callback_url" not in body
+
+
+class TestFailureAwareFingerprint:
+    PAGE = {"url": "https://example.com/", "fingerprint": "a" * 64}
+
+    def test_no_failures_keeps_the_previous_fingerprint_format(self):
+        assert (gs.fingerprint_source_pages([self.PAGE])
+                == gs.fingerprint_source_pages([self.PAGE], [])
+                == gs.fingerprint_source_pages([self.PAGE], None))
+
+    def test_failed_pages_count_by_address_in_any_order(self):
+        dead = ["https://example.com/b", "https://example.com/a#frag"]
+        with_failures = gs.fingerprint_source_pages([self.PAGE], dead)
+        assert with_failures != gs.fingerprint_source_pages([self.PAGE])
+        assert with_failures == gs.fingerprint_source_pages(
+            [self.PAGE], ["https://example.com/a", "https://example.com/b"]
+        )
+        assert with_failures != gs.fingerprint_source_pages([self.PAGE], ["https://example.com/a"])
+
+
+def _stub_job_with_dead_link(monkeypatch, source_page, base_url):
+    dead_url = "https://example.com/gone"
+    monkeypatch.setattr(gs, "get_robots_parser", lambda origin: None)
+    monkeypatch.setattr(gs, "fetch_url_html_content", lambda url: "<html>homepage</html>")
+    monkeypatch.setattr(gs, "discover_all_candidate_urls", lambda *args: (
+        [base_url, dead_url], {"method": "sitemap"}, {}
+    ))
+    monkeypatch.setattr(gs, "select_knowledge_pages_deterministically", lambda *args, **kwargs: (
+        [{"url": base_url, "cluster": "company_information"},
+         {"url": dead_url, "cluster": "auto_keyword"}],
+        {"llm_selection_skipped": True},
+    ))
+    monkeypatch.setattr(gs, "fetch_clean_pages_parallel", lambda *args, **kwargs: (
+        [source_page], [], {"selenium_fallbacks": 0}, [{
+            "url": dead_url, "error": "HTTP 404", "error_code": "site_unreachable",
+        }]
+    ))
+    monkeypatch.setattr(gs, "notify_job_callback", lambda *args: None)
+    return dead_url
+
+
+def test_same_dead_link_as_last_time_is_unchanged(monkeypatch):
+    base_url = "https://example.com/"
+    source_page = {
+        "url": base_url, "title": "Example",
+        "fingerprint": gs.fingerprint_source_page(base_url, "Example", "Stable source"),
+        "text": "Stable source", "cluster": "company_information",
+    }
+    dead_url = _stub_job_with_dead_link(monkeypatch, source_page, base_url)
+    monkeypatch.setattr(gs, "detect_site_language", lambda *args, **kwargs: pytest.fail(
+        "an unchanged refresh must not reach model work"
+    ))
+
+    # First run (no previous fingerprint) reports a fingerprint that includes the dead link.
+    expected = gs.fingerprint_source_pages([source_page], [dead_url])
+    job_id = _register_test_job()
+    gs.run_knowledge_base_job(job_id, base_url, 2, False, previous_fingerprint=expected)
+    job = gs.jobs[job_id]
+
+    assert job["status"] == "completed"
+    assert job["unchanged"] is True
+    assert job["source_fingerprint"] == expected
+    assert job["page_failures"] == [{
+        "url": dead_url, "error": "HTTP 404", "error_code": "site_unreachable",
+    }]
+    assert job["cost_estimation"]["prompt_tokens"] == 0
+
+
+def test_deterministic_selector_folds_scheme_and_trailing_slash_variants():
+    urls = [
+        "https://info.cern.ch", "http://info.cern.ch/",
+        "http://info.cern.ch/about", "https://info.cern.ch/about/",
+        "http://info.cern.ch/hypertext/WWW/TheProject.html",
+    ]
+    selected, _ = gs.select_knowledge_pages_deterministically("https://info.cern.ch", urls, 10)
+    assert [page["url"] for page in selected] == [
+        "https://info.cern.ch",
+        "https://info.cern.ch/about/",
+        "http://info.cern.ch/hypertext/WWW/TheProject.html",
+    ]
+
+
+def test_specific_pages_fold_variants_and_reuse_the_homepage_address():
+    pages = [{"url": u} for u in (
+        "http://example.com/", "https://example.com/faq", "https://example.com/faq/",
+    )]
+    selected = gs.select_specific_pages_deterministically("https://example.com", pages, 10)
+    assert [page["url"] for page in selected] == ["https://example.com", "https://example.com/faq"]
+
+
+def test_page_without_title_has_no_placeholder_title():
+    assert gs.get_page_title_from_html("<html><body>no title</body></html>") is None
+    assert gs.get_page_title_from_html("<title>  </title>") is None
+    assert gs.get_page_title_from_html("") is None
+    assert gs.get_page_title_from_html("<title> About </title>") == "About"
+
+
+def _post_kb(json_body):
+    return gs.app.test_client().post(
+        "/api/generate-knowledge-base", headers={"api-key": "test-key"}, json=json_body,
+    )
+
+
+@pytest.mark.parametrize("body, resolver_error, expected_code", [
+    ({"url": "https://no-such-host.invalid/"}, "Could not resolve hostname 'no-such-host.invalid'.",
+     "site_unreachable"),
+    ({"url": "http://10.0.0.1/"}, "URL resolves to a non-public network address; refusing to fetch it.",
+     "url_refused"),
+    ({"url": "ftp://example.com/"}, "URL must use http or https.", "url_refused"),
+    ({}, None, "invalid_request"),
+    ({"url": "https://example.com/", "max_pages": "many"}, None, "invalid_request"),
+    ({"url": "https://example.com/", "previous_fingerprint": "abc"}, None, "invalid_request"),
+])
+def test_every_submission_400_has_an_error_code(monkeypatch, body, resolver_error, expected_code):
+    monkeypatch.setattr(gs, "EXPECTED_SERVICE_API_KEY", "test-key")
+    monkeypatch.setattr(gs, "resolve_public_http_url", lambda url: (
+        (None, resolver_error) if resolver_error else (["93.184.216.34"], None)
+    ))
+    monkeypatch.setattr(gs.SESSION, "head", lambda *args, **kwargs: pytest.fail(
+        "invalid submissions must be rejected before the preflight"
+    ))
+
+    response = _post_kb(body)
+
+    assert response.status_code == 400
+    assert response.get_json()["error_code"] == expected_code
+
+
+def test_non_json_submission_has_an_error_code(monkeypatch):
+    monkeypatch.setattr(gs, "EXPECTED_SERVICE_API_KEY", "test-key")
+    response = gs.app.test_client().post(
+        "/api/generate-knowledge-base", headers={"api-key": "test-key"}, data="not json",
+    )
+    assert response.status_code == 400
+    assert response.get_json()["error_code"] == "invalid_request"
+
+
+def test_refused_head_falls_back_to_get_and_reports_its_timeout(monkeypatch):
+    monkeypatch.setattr(gs, "EXPECTED_SERVICE_API_KEY", "test-key")
+    monkeypatch.setattr(gs, "get_robots_parser", lambda origin: None)
+    monkeypatch.setattr(gs.SESSION, "head", lambda *args, **kwargs: type(
+        "HeadResponse", (), {"status_code": 400, "reason": "Bad Request"}
+    )())
+
+    def slow_get(*args, **kwargs):
+        raise gs.requests.exceptions.ReadTimeout("read timed out")
+
+    monkeypatch.setattr(gs.SESSION, "get", slow_get)
+    response = _post_kb({"url": "https://93.184.216.34/delay/15"})
+
+    assert response.status_code == 400
+    assert response.get_json()["error_code"] == "timed_out"
