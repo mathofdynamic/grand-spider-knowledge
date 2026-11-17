@@ -610,7 +610,7 @@ def discover_core_pages_only(base_url: str, specific_pages: list = None) -> list
         for page_url in sorted(set(specific_pages)):
             discovered_pages.append({
                 'url': page_url,
-                'title': 'N/A',
+                'title': None,
                 'type': 'specified_core_page'
             })
         
@@ -714,7 +714,8 @@ def get_json_body():
     """Parse the request's JSON body. Returns (data, None) or (None, error_response)."""
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
-        return None, (jsonify({"error": "Request body must be a JSON object."}), 400)
+        return None, (jsonify({"error": "Request body must be a JSON object.",
+                               "error_code": "invalid_request"}), 400)
     return data, None
 
 
@@ -761,6 +762,18 @@ def validate_public_http_url(url) -> str | None:
     """Reject URLs that are not public http(s) targets (SSRF guard)."""
     _, error = resolve_public_http_url(url)
     return error
+
+
+def url_validation_error_code(error: str) -> str:
+    """Public code for a validate_public_http_url failure: DNS miss vs. refused target."""
+    if error and error.startswith("Could not resolve hostname"):
+        return "site_unreachable"
+    return "url_refused"
+
+
+def _submission_error(message: str, error_code: str = "invalid_request", **extra):
+    """400 response for a rejected submission; every one carries an error_code."""
+    return jsonify({"error": message, "error_code": error_code, **extra}), 400
 
 
 def post_callback_event(callback_url: str, payload: dict):
@@ -925,13 +938,17 @@ def extract_all_elements(html_content: str) -> dict:
 
 # --- Feature: Knowledge Base Generation (from Code 2) & General Crawling ---
 
-def get_page_title_from_html(html_content):
-    if not html_content: return "N/A"
+def get_page_title_from_html(html_content) -> str | None:
+    """Return the page's <title> text, or None when it has no usable title."""
+    if not html_content:
+        return None
     try:
         soup_title = BeautifulSoup(html_content, 'html.parser')
         title_tag = soup_title.find('title')
-        return title_tag.string.strip() if title_tag and title_tag.string else "N/A"
-    except Exception: return "N/A"
+        title = title_tag.string.strip() if title_tag and title_tag.string else ""
+        return title or None
+    except Exception:
+        return None
 
 
 CRAWL_FAILURE_CODES = {
@@ -1246,7 +1263,7 @@ def selenium_crawl_website(base_url, max_pages=10):
                 driver.get(current_url)
                 WebDriverWait(driver, SELENIUM_PAGE_LOAD_TIMEOUT).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
                 time.sleep(SELENIUM_RENDER_WAIT_SECONDS)
-                page_title = driver.title.strip() or "N/A"
+                page_title = driver.title.strip() or None
                 page_html = driver.page_source
                 found_pages_details.append({'url': current_url, 'title': page_title, 'status': 'found_by_selenium', 'html_source': page_html})
                 logger.info(f"[Selenium] Found page ({len(found_pages_details)}/{max_pages}): {current_url}")
@@ -1799,7 +1816,7 @@ def extract_knowledge_from_page_with_openai(html_content: str, url: str, title: 
     user_text = f"""Extract ALL customer-relevant knowledge from this web page for a customer-support chatbot.
 
 URL: {url}
-Page Title: {title}
+Page Title: {title or ""}
 
 Capture (when present): contact details (phones, emails, addresses, hours, social links),
 company background/mission, policies (shipping, returns, refunds, warranty, privacy, terms),
@@ -2296,6 +2313,29 @@ def select_knowledge_pages(base_url: str, candidate_urls: list, lang: str, page_
     return selected[:page_budget], selection_meta
 
 
+def page_identity(url: str) -> tuple:
+    """Key that treats http/https, default ports, host case, and a trailing slash as one page."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    port = parsed.port
+    if port and port != (443 if parsed.scheme == "https" else 80):
+        host = f"{host}:{port}"
+    path = parsed.path.rstrip("/") or "/"
+    return host, path, parsed.query
+
+
+def fold_url_variants(urls: list, preferred_scheme: str = "https") -> list:
+    """Keep one URL per page identity, preferring `preferred_scheme`, else the first seen."""
+    chosen = {}
+    for url in urls:
+        key = page_identity(url)
+        current = chosen.get(key)
+        if current is None or (urlparse(current).scheme != preferred_scheme
+                               and urlparse(url).scheme == preferred_scheme):
+            chosen[key] = url
+    return list(chosen.values())
+
+
 def select_knowledge_pages_deterministically(base_url: str, candidate_urls: list,
                                               page_budget: int, sitemap_meta: dict = None):
     """Select a stable page set so a job fingerprint can be compared on later crawls."""
@@ -2305,9 +2345,10 @@ def select_knowledge_pages_deterministically(base_url: str, candidate_urls: list
     )
     kept, dropped_counts = prefilter_candidate_urls(stable_candidates, base_domain)
     base_norm = urlparse(base_url)._replace(fragment="").geturl()
-    kept = list(dict.fromkeys(kept))
-    if base_norm in kept:
-        kept.remove(base_norm)
+    base_identity = page_identity(base_norm)
+    # Fold http/https and trailing-slash variants so one page never fills two slots.
+    kept = [url for url in fold_url_variants(kept, urlparse(base_norm).scheme)
+            if page_identity(url) != base_identity]
 
     # Rank by stable URL features only. Sitemap metadata can change without page text
     # changing, so it must not move a different URL into the budgeted fingerprint set.
@@ -2323,7 +2364,7 @@ def select_knowledge_pages_deterministically(base_url: str, candidate_urls: list
 
     return selected[:page_budget], {
         "candidates_total": len(candidate_urls),
-        "after_prefilter": len(kept) + (1 if base_norm not in kept else 0),
+        "after_prefilter": len(kept) + 1,
         "dropped_by_reason": dropped_counts,
         "clusters": None,
         "auto_selected_by_keyword": sum(
@@ -2337,12 +2378,18 @@ def select_knowledge_pages_deterministically(base_url: str, candidate_urls: list
 def select_specific_pages_deterministically(base_url: str, pages: list[dict], page_budget: int):
     """Apply a stable budget to explicitly supplied pages, preserving the homepage first."""
     base_norm = urlparse(base_url)._replace(fragment="").geturl()
-    unique_pages = {}
+    clusters = {}
     for page in pages or []:
         url = urlparse(page.get("url", ""))._replace(fragment="").geturl()
         if url:
-            unique_pages.setdefault(url, {"url": url, "cluster": page.get("cluster", "company_information")})
-    ordered = sorted(unique_pages.values(), key=lambda page: (
+            clusters.setdefault(url, page.get("cluster", "company_information"))
+    base_identity = page_identity(base_norm)
+    unique_urls = fold_url_variants(sorted(clusters), urlparse(base_norm).scheme)
+    unique_pages = [
+        {"url": base_norm if page_identity(url) == base_identity else url, "cluster": clusters[url]}
+        for url in unique_urls
+    ]
+    ordered = sorted(unique_pages, key=lambda page: (
         page["url"] != base_norm,
         -knowledge_path_score(page["url"]),
         page["url"],
@@ -2362,15 +2409,24 @@ def fingerprint_source_page(url: str, title: str, text: str) -> str:
     return hashlib.sha256(source.encode("utf-8", "ignore")).hexdigest()
 
 
-def fingerprint_source_pages(pages: list[dict]) -> str:
-    """Hash the ordered set of page addresses and their source fingerprints."""
+def fingerprint_source_pages(pages: list[dict], failed_urls: list = None) -> str:
+    """Hash the page addresses, their source fingerprints, and the selected pages that failed.
+
+    Failed pages count by address only, so a page that keeps failing (a dead link) leaves the
+    fingerprint stable, while a page that starts or stops failing changes it. With no failures
+    the payload is identical to the pre-failure-aware format, so existing fingerprints still match.
+    """
     page_rows = []
     for page in pages:
         url = urlparse(page.get("url", ""))._replace(fragment="").geturl()
         page_rows.append({"url": url, "fingerprint": page.get("fingerprint", "")})
     page_rows.sort(key=lambda row: row["url"])
+    fingerprint_payload = {"version": SOURCE_FINGERPRINT_VERSION, "pages": page_rows}
+    failed = sorted({urlparse(url)._replace(fragment="").geturl() for url in failed_urls or [] if url})
+    if failed:
+        fingerprint_payload["failed"] = failed
     payload = json.dumps(
-        {"version": SOURCE_FINGERPRINT_VERSION, "pages": page_rows},
+        fingerprint_payload,
         ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8", "ignore")).hexdigest()
@@ -2444,7 +2500,7 @@ def extract_pages_parallel(pages: list, lang: str, cost: CostAccumulator,
                 logger.debug(f"Structured-data harvest failed for {url}: {e}")
 
             title = get_page_title_from_html(html)
-            if not title or title == "N/A":
+            if not title:
                 slug = unquote(urlparse(url).path or "").strip("/").split("/")[-1]
                 title = page.get("title") or (slug.replace("-", " ").replace("_", " ").title()
                                                if slug else urlparse(url).netloc)
@@ -2558,7 +2614,7 @@ def fetch_clean_pages_parallel(pages: list, use_selenium: bool = False,
                 _record_failure("The page contained no readable text after cleaning.")
                 return None
 
-            title = get_page_title_from_html(html) or page.get("title", "N/A")
+            title = get_page_title_from_html(html) or page.get("title") or None
             source_fingerprint = fingerprint_source_page(url, title, clean_text)
             try:
                 structured = extract_structured_data(html, url)
@@ -2908,7 +2964,9 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
                 "No readable page content could be fetched from the selected URLs.", error_code
             )
 
-        source_fingerprint = fingerprint_source_pages(source_pages)
+        source_fingerprint = fingerprint_source_pages(
+            source_pages, [failure.get("url") for failure in fetch_failures]
+        )
         page_results = [
             {"url": page["url"], "title": page["title"], "fingerprint": page["fingerprint"],
              "text": page["text"]}
@@ -2916,9 +2974,10 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
         ]
         page_fingerprints = {page["url"]: page["fingerprint"] for page in page_results}
 
-        if (previous_fingerprint and not fetch_failures and len(source_pages) == len(selected)
-                and hmac.compare_digest(
-                source_fingerprint, previous_fingerprint.lower())):
+        # The fingerprint covers failed pages too, so a match means the same pages loaded
+        # with the same content and the same pages failed as last time.
+        if previous_fingerprint and hmac.compare_digest(
+                source_fingerprint, previous_fingerprint.lower()):
             finished_at = time.time()
             update_job_progress(job_id, "Source pages are unchanged; skipping model processing.")
             with jobs_lock:
@@ -2928,6 +2987,7 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
                     "source_fingerprint": source_fingerprint,
                     "page_fingerprints": page_fingerprints,
                     "pages": page_results,
+                    "page_failures": fetch_failures,
                     "source_pages_count": len(page_results),
                     "extracted_pages_count": 0,
                     "cost_estimation": cost.cost_estimation(),
@@ -3223,22 +3283,23 @@ def start_knowledge_base_generation():
     if err: return err
     url = data.get('url')
     if not url:
-        return jsonify({"error": "Valid 'url' is required"}), 400
+        return _submission_error("Valid 'url' is required")
     url_error = validate_public_http_url(url)
     if url_error:
-        return jsonify({"error": f"Invalid 'url': {url_error}"}), 400
+        return _submission_error(f"Invalid 'url': {url_error}", url_validation_error_code(url_error))
 
     # Get specific pages if provided
     specific_pages = data.get('specific_pages')
     if 'specific_pages' in data:
         if not isinstance(specific_pages, list):
-            return jsonify({"error": "'specific_pages' must be a list of URLs"}), 400
+            return _submission_error("'specific_pages' must be a list of URLs")
         if not specific_pages:
-            return jsonify({"error": "'specific_pages' must contain at least one URL when provided"}), 400
+            return _submission_error("'specific_pages' must contain at least one URL when provided")
     for sp in (specific_pages or []):
         url_error = validate_public_http_url(sp)
         if url_error:
-            return jsonify({"error": f"Invalid specific page URL {sp!r}: {url_error}"}), 400
+            return _submission_error(f"Invalid specific page URL {sp!r}: {url_error}",
+                                     url_validation_error_code(url_error))
 
     # Optional new params (safe defaults preserve prior behaviour for existing callers).
     depth = str(data.get('depth', 'deep')).lower()
@@ -3252,26 +3313,26 @@ def start_knowledge_base_generation():
     try:
         max_pages = int(data.get('max_pages', DEFAULT_KB_PAGE_BUDGET))
     except (TypeError, ValueError):
-        return jsonify({"error": "'max_pages' must be an integer"}), 400
+        return _submission_error("'max_pages' must be an integer")
     max_pages = max(1, min(max_pages, MAX_KB_PAGE_BUDGET))
 
     previous_fingerprint = data.get('previous_fingerprint', data.get('source_fingerprint'))
     if previous_fingerprint is not None:
         if not isinstance(previous_fingerprint, str) or not re.fullmatch(r'[0-9a-fA-F]{64}', previous_fingerprint):
-            return jsonify({"error": "'previous_fingerprint' must be a 64-character SHA-256 hex digest"}), 400
+            return _submission_error("'previous_fingerprint' must be a 64-character SHA-256 hex digest")
         previous_fingerprint = previous_fingerprint.lower()
 
     callback_url = data.get('callback_url')
     if callback_url is not None:
         if not isinstance(callback_url, str) or len(callback_url) > 2048:
-            return jsonify({"error": "'callback_url' must be a valid URL no longer than 2048 characters"}), 400
+            return _submission_error("'callback_url' must be a valid URL no longer than 2048 characters")
         if not callback_url.strip():
             callback_url = None
         else:
             callback_url = callback_url.strip()
             callback_url_error = validate_public_http_url(callback_url)
             if callback_url_error:
-                return jsonify({"error": f"Invalid 'callback_url': {callback_url_error}"}), 400
+                return _submission_error(f"Invalid 'callback_url': {callback_url_error}")
 
     # Validate accessibility before starting a job, except when robots.txt disallows
     # the base URL; the background crawler will then report a fixed blocked code.
@@ -3281,8 +3342,9 @@ def start_knowledge_base_generation():
             test_response = SESSION.head(url, timeout=10, allow_redirects=True)
             status_code = test_response.status_code
             reason = test_response.reason
-            if status_code in (405, 501):
-                # Some sites disable HEAD while serving normal GET requests.
+            if status_code >= 400:
+                # Many sites reject or mishandle HEAD while serving GET normally, so a
+                # refused HEAD is only a hint; the GET result decides.
                 probe_response = SESSION.get(url, timeout=10, allow_redirects=True, stream=True)
                 try:
                     status_code = probe_response.status_code
