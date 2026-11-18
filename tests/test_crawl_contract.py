@@ -179,6 +179,7 @@ def test_discovery_cap_uses_stable_priority_order(monkeypatch):
     }}
     monkeypatch.setattr(gs, "find_sitemap_urls", lambda url: (sitemap["urls"], sitemap["meta"]))
     monkeypatch.setattr(gs, "MAX_DISCOVERY_URLS", 3)
+    monkeypatch.setattr(gs, "_landed_url", lambda url: url)
 
     first, first_meta, _ = gs.discover_all_candidate_urls(base_url)
     sitemap["urls"] = list(reversed(sitemap["urls"]))

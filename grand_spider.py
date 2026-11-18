@@ -650,7 +650,7 @@ def discover_core_pages_only(base_url: str, specific_pages: list = None) -> list
         if not robots_allows(robots, test_url):
             continue
         try:
-            response = SESSION.head(test_url, timeout=5, allow_redirects=True)
+            response = probe_url(test_url, timeout=5)
             if response.status_code < 400:
                 discovered_pages.append({
                     'url': test_url,
@@ -998,6 +998,27 @@ def _http_error_code(status_code: int) -> str:
         return "timed_out"
     return "site_unreachable"
 
+
+def probe_url(url: str, timeout: float = 10):
+    """Check that `url` answers, without downloading its body.
+
+    Tries HEAD first. Many sites and firewalls refuse HEAD (4xx/405/501) or drop it
+    while serving GET normally, so any HEAD failure is retried as a GET that stops after
+    the headers. Returns the deciding response (already closed; read only status_code,
+    reason, url). Raises requests' exceptions only when the GET itself fails.
+    """
+    try:
+        response = SESSION.head(url, timeout=timeout, allow_redirects=True)
+        if response.status_code < 400:
+            return response
+        logger.info(f"HEAD {url} returned {response.status_code}; retrying with GET")
+    except requests.exceptions.RequestException as error:
+        logger.info(f"HEAD {url} failed ({error}); retrying with GET")
+    response = SESSION.get(url, timeout=timeout, allow_redirects=True, stream=True)
+    response.close()
+    return response
+
+
 def fetch_url_html_content(url: str, for_lang_detect=False) -> str | None:
     headers = {'User-Agent': CRAWLER_USER_AGENT}
     try:
@@ -1192,43 +1213,139 @@ def find_sitemap_urls(base_url: str):
     return list(final_page_urls), meta_by_url
 
 
-def simple_crawl_website(base_url, max_pages=10):
+def _strip_www(host: str) -> str:
+    return host[4:] if host.startswith("www.") else host
+
+
+def _site_key(url: str):
+    """(host without www., explicit non-default port) — http/https and www. share a key."""
+    parsed = urlparse(url)
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if port == {"http": 80, "https": 443}.get(parsed.scheme):
+        port = None
+    host = _strip_www((parsed.hostname or "").lower())
+    return (host, port) if host else None
+
+
+def is_same_site(url: str, site_url: str) -> bool:
+    key = _site_key(url)
+    return key is not None and key == _site_key(site_url)
+
+
+def canonicalize_site_url(url: str, site_url: str) -> str:
+    """Drop the fragment and, for pages of the same site, use `site_url`'s scheme and host.
+
+    `site_url` should be where the start page actually landed after redirects, so every
+    address of a crawl takes the one form the site itself serves.
+    """
+    parsed = urlparse(url)._replace(fragment="")
+    if parsed.scheme in ("http", "https") and is_same_site(url, site_url):
+        site = urlparse(site_url)
+        parsed = parsed._replace(scheme=site.scheme, netloc=site.netloc)
+    return parsed.geturl()
+
+
+def _crawl_failure(error) -> CrawlServiceError:
+    if isinstance(error, CrawlServiceError):
+        return error
+    return CrawlServiceError(str(error), crawl_failure_code(error))
+
+
+def simple_crawl_website(base_url, max_pages=10, outcome: dict = None):
+    """Breadth-first link crawl of one site.
+
+    `outcome`, when given, is filled with what discovery needs to judge the crawl:
+    `site_url` (where the start page landed), `start_error` (a CrawlServiceError when
+    the start page could not be read), `links_found` and `pages_failed`.
+    """
     logger.info(f"Starting simple crawl for {base_url}, max_pages={max_pages}")
+    outcome = {} if outcome is None else outcome
+    outcome.update({"site_url": base_url, "start_error": None, "links_found": 0, "pages_failed": 0})
     urls_to_visit = collections.deque([base_url])
     queued_urls = {base_url}
     visited_urls = set()
     found_pages_details = []
-    base_domain = urlparse(base_url).netloc
+    site_url = base_url
     robots = get_robots_parser(base_url)
     while urls_to_visit and len(found_pages_details) < max_pages:
         current_url = urls_to_visit.popleft()
-        if current_url in visited_urls or urlparse(current_url).netloc != base_domain:
+        if current_url in visited_urls or not is_same_site(current_url, site_url):
             continue
         visited_urls.add(current_url)
+        is_start = current_url == base_url
         if not robots_allows(robots, current_url):
             logger.info(f"[Simple] Skipping robots-disallowed URL: {current_url}")
+            if is_start:
+                outcome["start_error"] = CrawlServiceError(
+                    "The start page is disallowed by robots.txt.", "blocked")
             continue
         if found_pages_details:
             time.sleep(CRAWL_DELAY_SECONDS)
-        try:
-            response = SESSION.get(current_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-            response.raise_for_status()
-            if response.status_code == 200 and 'text/html' in response.headers.get('Content-Type', '').lower():
-                found_pages_details.append({'url': current_url, 'status': 'found'})
-                logger.info(f"[Simple] Found page ({len(found_pages_details)}/{max_pages}): {current_url}")
-                soup = BeautifulSoup(response.text, 'html.parser')
-                discovered_links = set()
-                for link in soup.find_all('a', href=True):
-                    absolute_url = urljoin(base_url, link['href'])
-                    absolute_url = urlparse(absolute_url)._replace(fragment="").geturl()
-                    if urlparse(absolute_url).netloc == base_domain:
-                        discovered_links.add(absolute_url)
-                for absolute_url in sorted(discovered_links):
-                    if absolute_url not in visited_urls and absolute_url not in queued_urls:
-                        urls_to_visit.append(absolute_url)
-                        queued_urls.add(absolute_url)
-        except requests.exceptions.RequestException as e:
-            logger.error(f"[Simple] Error crawling URL {current_url}: {e}")
+        # The start page carries every link the crawl will follow, so one transient
+        # failure there must not end discovery: try it a second time.
+        attempts = 2 if is_start else 1
+        response, last_error = None, None
+        for attempt in range(attempts):
+            if attempt:
+                time.sleep(2)
+            try:
+                response = SESSION.get(current_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+                response.raise_for_status()
+                if 'text/html' not in response.headers.get('Content-Type', '').lower():
+                    raise CrawlServiceError(f"{current_url} is not an HTML page.", "no_readable_content")
+                last_error = None
+                break
+            except (requests.exceptions.RequestException, CrawlServiceError) as error:
+                response, last_error = None, error
+                logger.error(f"[Simple] Error crawling URL {current_url} "
+                             f"(attempt {attempt + 1}/{attempts}): {error}")
+        if last_error is not None:
+            status = getattr(getattr(last_error, "response", None), "status_code", None)
+            if isinstance(last_error, CrawlServiceError) or status in (404, 410):
+                outcome["dead_links"] = outcome.get("dead_links", 0) + 1
+            else:
+                outcome["pages_failed"] += 1
+                outcome["last_failure_code"] = crawl_failure_code(last_error)
+            if is_start:
+                outcome["start_error"] = _crawl_failure(last_error)
+            continue
+
+        page_url = current_url
+        if is_start:
+            landed = getattr(response, "url", None) or base_url
+            if is_same_site(landed, base_url):
+                site_url = landed
+                outcome["site_url"] = landed
+                if urlparse(landed)[:2] != urlparse(base_url)[:2]:
+                    robots = get_robots_parser(landed)  # links are fetched from this origin
+            page_url = canonicalize_site_url(base_url, site_url)
+            # Links back to the start page (in any spelling) must not re-crawl it.
+            start_forms = {page_url, canonicalize_site_url(landed, site_url)}
+            start_forms |= {u.rstrip("/") for u in start_forms} | {
+                u + "/" for u in start_forms if not urlparse(u).path.strip("/")}
+            visited_urls |= start_forms
+            queued_urls |= start_forms
+        found_pages_details.append({'url': page_url, 'status': 'found'})
+        logger.info(f"[Simple] Found page ({len(found_pages_details)}/{max_pages}): {page_url}")
+        # Relative links resolve against the page they appear on (after redirects).
+        link_base = getattr(response, "url", None) or current_url
+        soup = BeautifulSoup(response.text, 'html.parser')
+        discovered_links = set()
+        for link in soup.find_all('a', href=True):
+            try:
+                absolute_url = urljoin(link_base, link['href'])
+                if urlparse(absolute_url).scheme in ("http", "https") and is_same_site(absolute_url, site_url):
+                    discovered_links.add(canonicalize_site_url(absolute_url, site_url))
+            except ValueError:  # malformed href, e.g. "http://[broken"
+                continue
+        for absolute_url in sorted(discovered_links):
+            if absolute_url not in visited_urls and absolute_url not in queued_urls:
+                urls_to_visit.append(absolute_url)
+                queued_urls.add(absolute_url)
+                outcome["links_found"] += 1
     return found_pages_details
 
 
@@ -1362,9 +1479,9 @@ def scrape_single_page(url: str, use_selenium: bool = False, include_screenshot:
     """Synchronously scrape and extract structured knowledge from a single URL."""
     # Validate URL accessibility
     try:
-        head_resp = SESSION.head(url, timeout=10, allow_redirects=True)
-        if head_resp.status_code >= 400:
-            raise ValueError(f"URL returned HTTP {head_resp.status_code}")
+        probe_resp = probe_url(url, timeout=10)
+        if probe_resp.status_code >= 400:
+            raise ValueError(f"URL returned HTTP {probe_resp.status_code}")
     except requests.exceptions.RequestException as e:
         raise ConnectionError(f"URL is not accessible: {e}") from e
 
@@ -2162,6 +2279,16 @@ def prefilter_candidate_urls(urls: list, base_domain: str, keep_product_sample: 
     return kept, dict(dropped)
 
 
+def _landed_url(base_url: str) -> str:
+    """Where `base_url` ends up after redirects, if that is still the same site."""
+    try:
+        landed = probe_url(base_url, timeout=10).url or base_url
+    except requests.exceptions.RequestException as error:
+        logger.info(f"Could not resolve redirects for {base_url}: {error}")
+        return base_url
+    return landed if is_same_site(landed, base_url) else base_url
+
+
 def discover_all_candidate_urls(base_url: str, use_selenium: bool = False):
     """Discover candidate page URLs: sitemap first (scales to huge sites), crawl fallback.
 
@@ -2177,23 +2304,63 @@ def discover_all_candidate_urls(base_url: str, use_selenium: bool = False):
     meta["sitemap_urls"] = len(sitemap_urls)
 
     candidates = list(sitemap_urls)
+    site_url = base_url
     if len(candidates) >= 5:
         meta["method"] = "sitemap"
+        site_url = _landed_url(base_url)
     else:
         meta["method"] = "crawl"
-        try:
-            crawl_cap = min(MAX_PAGES_FOR_FALLBACK_DISCOVERY_CRAWL, MAX_DISCOVERY_URLS)
-            if use_selenium and SELENIUM_AVAILABLE:
+        crawl_cap = min(MAX_PAGES_FOR_FALLBACK_DISCOVERY_CRAWL, MAX_DISCOVERY_URLS)
+        crawled = []
+        if use_selenium and SELENIUM_AVAILABLE:
+            try:
                 crawled = selenium_crawl_website(base_url, max_pages=crawl_cap)
-            else:
-                crawled = simple_crawl_website(base_url, max_pages=crawl_cap)
-            crawl_urls = [c['url'] for c in crawled]
-            meta["crawled_urls"] = len(crawl_urls)
-            candidates.extend(crawl_urls)
-        except Exception as e:
-            logger.warning(f"Fallback crawl failed for {base_url}: {e}")
+            except Exception as e:
+                logger.warning(f"Selenium discovery crawl failed for {base_url}: {e}")
+            if not crawled:
+                logger.info("Selenium found no pages; retrying discovery with the plain crawler")
+        outcome = {}
+        if not crawled:
+            try:
+                crawled = simple_crawl_website(base_url, max_pages=crawl_cap, outcome=outcome)
+            except Exception as e:
+                logger.warning(f"Fallback crawl failed for {base_url}: {e}")
+                outcome["start_error"] = _crawl_failure(e)
+        site_url = outcome.get("site_url") or base_url
+        if "site_url" not in outcome:
+            site_url = _landed_url(base_url)
+        crawl_urls = [c['url'] for c in crawled]
+        meta["crawled_urls"] = len(crawl_urls)
+        meta["links_found"] = outcome.get("links_found", 0)
+        meta["pages_failed"] = outcome.get("pages_failed", 0)
+        candidates.extend(crawl_urls)
+        # Discovery failed when the crawl could not read the start page, or found links
+        # but every one it tried failed at the network level (timeouts, refusals, 5xx).
+        # A start page with no links, or only dead (404) links, is a real one-page site.
+        failure = outcome.get("start_error")
+        if (failure is None and len(crawl_urls) <= 1 and meta["pages_failed"]
+                and not outcome.get("dead_links")):
+            failure = CrawlServiceError(
+                f"Discovery found {meta['links_found']} links but could read none of them.",
+                outcome.get("last_failure_code", "site_unreachable"))
+        if failure is not None and not sitemap_urls:
+            meta["failed"] = True
+            meta["error"] = str(failure)
+            meta["error_code"] = failure.error_code
+            logger.warning(f"Page discovery failed for {base_url}: {failure} ({failure.error_code})")
 
-    candidates.insert(0, base_url)
+    # Every address takes the form the site redirected to (scheme and www.), so one
+    # page never appears as both http:// and https://.
+    site_url_error = validate_public_http_url(site_url) if site_url != base_url else None
+    if site_url_error:
+        logger.warning(f"Ignoring redirected site address {site_url}: {site_url_error}")
+        site_url = base_url
+    meta["site_url"] = canonicalize_site_url(base_url, site_url)
+    candidates = list(dict.fromkeys(
+        [meta["site_url"]]
+        + [canonicalize_site_url(url, site_url) for url in candidates if isinstance(url, str) and url]
+    ))
+    base_url = meta["site_url"]
 
     if len(candidates) > MAX_DISCOVERY_URLS:
         meta["capped"] = True
@@ -2917,6 +3084,7 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
                 main_page_html = None
 
         discovery_meta, selection_meta = {}, {}
+        home_url = base_url  # the homepage address as the site serves it (set by discovery)
         if specific_pages:
             update_job_progress(job_id, "Discovering core website pages...")
             discovered = discover_core_pages_only(base_url, specific_pages)
@@ -2938,8 +3106,19 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
         else:
             update_job_progress(job_id, "Discovering all pages (Sitemap)...")
             candidates, discovery_meta, sitemap_meta = discover_all_candidate_urls(base_url, use_selenium)
+            if discovery_meta.get("failed") and page_budget > 1:
+                # A refresh built from the homepage alone would replace the whole site's
+                # knowledge with one page, so a failed discovery fails the job instead.
+                raise CrawlServiceError(
+                    "Page discovery failed, so only the start page could be found: "
+                    f"{discovery_meta.get('error')}",
+                    discovery_meta.get("error_code") or "site_unreachable",
+                )
+            home_url = discovery_meta.get("site_url") or base_url
+            if home_url != base_url:
+                logger.info(f"Using the site's own address form {home_url} for {base_url}")
             selected, selection_meta = select_knowledge_pages_deterministically(
-                base_url, candidates, page_budget, sitemap_meta=sitemap_meta
+                home_url, candidates, page_budget, sitemap_meta=sitemap_meta
             )
 
         with jobs_lock:
@@ -2947,13 +3126,13 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
         logger.info(f"Selected {len(selected)} pages for source fingerprinting")
 
         update_job_progress(job_id, "Reading source pages...")
-        prefetched = {base_url: main_page_html} if main_page_html else {}
+        prefetched = {home_url: main_page_html} if main_page_html else {}
         source_pages, per_page_structured, source_stats, fetch_failures = fetch_clean_pages_parallel(
             selected, use_selenium=use_selenium, prefetched_html=prefetched, job_id=job_id
         )
         if not source_pages:
             root_failure = next((failure for failure in fetch_failures
-                                 if failure.get("url") == base_url), None)
+                                 if failure.get("url") in (base_url, home_url)), None)
             error_code = (root_failure or {}).get("error_code")
             if not error_code and homepage_failure:
                 error_code = getattr(homepage_failure, "error_code", crawl_failure_code(homepage_failure))
@@ -3052,7 +3231,7 @@ def run_knowledge_base_job(job_id, base_url, max_pages_for_kb, use_selenium, spe
         # Per-page model extraction uses the exact cleaned source text that was fingerprinted.
         update_job_progress(job_id, "Extracting knowledge from pages...")
         chunks, extraction_stats = extract_prepared_pages_parallel(
-            source_pages, lang, cost, main_page_url=base_url,
+            source_pages, lang, cost, main_page_url=home_url,
             main_page_screenshot=main_page_screenshot, job_id=job_id,
         )
         extraction_stats.update(source_stats)
@@ -3339,18 +3518,10 @@ def start_knowledge_base_generation():
     try:
         preflight_robots = get_robots_parser(url)
         if robots_allows(preflight_robots, url):
-            test_response = SESSION.head(url, timeout=10, allow_redirects=True)
+            # A refused or dropped HEAD is only a hint; probe_url lets a GET decide.
+            test_response = probe_url(url, timeout=10)
             status_code = test_response.status_code
             reason = test_response.reason
-            if status_code >= 400:
-                # Many sites reject or mishandle HEAD while serving GET normally, so a
-                # refused HEAD is only a hint; the GET result decides.
-                probe_response = SESSION.get(url, timeout=10, allow_redirects=True, stream=True)
-                try:
-                    status_code = probe_response.status_code
-                    reason = probe_response.reason
-                finally:
-                    probe_response.close()
             if status_code >= 400:
                 return jsonify({
                     "error": f"Website is not accessible. HTTP {status_code}: {reason}",
